@@ -1,0 +1,49 @@
+name: Salt Relay Media Processing
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Unique Job ID'
+        required: true
+        type: string
+      media_json:
+        description: 'JSON list of media sources to process'
+        required: true
+        type: string
+      callback_url:
+        description: 'Webhook callback URL'
+        required: true
+        type: string
+      callback_secret:
+        description: 'Callback authentication secret'
+        required: true
+        type: string
+
+jobs:
+  process-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install FFmpeg and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl python3-pip
+
+      - name: Process Media Pipeline
+        id: pipeline
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          MEDIA_JSON: ${{ github.event.inputs.media_json }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          CALLBACK_SECRET: ${{ github.event.inputs.callback_secret }}
+        run: |
+          node scripts/process-media-runner.cjs

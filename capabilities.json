@@ -1,0 +1,144 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-10-22T07:22:00Z",
+  "platforms": {
+    "tiktok": {
+      "name": "TikTok",
+      "slug": "tiktok",
+      "supported_media": ["video"],
+      "allow_mixed_media": false,
+      "max_carousel_items": 1,
+      "caption_limit": 2200,
+      "story_support": true,
+      "scheduling_support": true,
+      "video_requirements": {
+        "formats": ["mp4", "mov"],
+        "max_size_mb": 500,
+        "max_duration_sec": 600,
+        "recommended_aspect_ratio": "9:16"
+      },
+      "image_requirements": null
+    },
+    "youtube": {
+      "name": "YouTube",
+      "slug": "youtube",
+      "supported_media": ["video"],
+      "allow_mixed_media": false,
+      "max_carousel_items": 1,
+      "caption_limit": 5000,
+      "title_limit": 100,
+      "story_support": false,
+      "scheduling_support": true,
+      "video_requirements": {
+        "formats": ["mp4", "mov", "webm"],
+        "max_size_mb": 2048,
+        "max_duration_sec": 43200,
+        "recommended_aspect_ratio": "16:9_or_9:16"
+      },
+      "image_requirements": null
+    },
+    "threads": {
+      "name": "Threads",
+      "slug": "threads",
+      "supported_media": ["image", "video"],
+      "allow_mixed_media": true,
+      "max_carousel_items": 10,
+      "caption_limit": 500,
+      "story_support": false,
+      "scheduling_support": true,
+      "video_requirements": {
+        "formats": ["mp4", "mov"],
+        "max_size_mb": 250,
+        "max_duration_sec": 300,
+        "recommended_aspect_ratio": "any"
+      },
+      "image_requirements": {
+        "formats": ["jpg", "jpeg", "png"],
+        "max_size_mb": 20
+      }
+    },
+    "instagram": {
+      "name": "Instagram",
+      "slug": "instagram",
+      "supported_media": ["image", "video"],
+      "allow_mixed_media": true,
+      "max_carousel_items": 10,
+      "caption_limit": 2200,
+      "story_support": true,
+      "scheduling_support": true,
+      "video_requirements": {
+        "formats": ["mp4", "mov"],
+        "max_size_mb": 500,
+        "max_duration_sec": 900,
+        "recommended_aspect_ratio": "9:16_or_1:1_or_4:5"
+      },
+      "image_requirements": {
+        "formats": ["jpg", "jpeg", "png"],
+        "max_size_mb": 20,
+        "recommended_aspect_ratio": "1:1_or_4:5_or_9:16"
+      }
+    },
+    "twitter": {
+      "name": "X (Twitter)",
+      "slug": "twitter",
+      "supported_media": ["image", "video"],
+      "allow_mixed_media": false,
+      "max_carousel_items": 4,
+      "caption_limit": 280,
+      "story_support": false,
+      "scheduling_support": true,
+      "video_requirements": {
+        "formats": ["mp4", "mov"],
+        "max_size_mb": 512,
+        "max_duration_sec": 140,
+        "max_items": 1
+      },
+      "image_requirements": {
+        "formats": ["jpg", "jpeg", "png", "webp", "gif"],
+        "max_size_mb": 5,
+        "max_items": 4
+      }
+    },
+    "telegram": {
+      "name": "Telegram",
+      "slug": "telegram",
+      "supported_media": ["image", "video"],
+      "allow_mixed_media": true,
+      "max_carousel_items": 10,
+      "caption_limit": 1024,
+      "story_support": true,
+      "scheduling_support": true,
+      "video_requirements": {
+        "formats": ["mp4"],
+        "max_size_mb": 2000,
+        "max_duration_sec": 7200
+      },
+      "image_requirements": {
+        "formats": ["jpg", "jpeg", "png", "webp"],
+        "max_size_mb": 10
+      }
+    },
+    "pinterest": {
+      "name": "Pinterest",
+      "slug": "pinterest",
+      "supported_media": ["image", "video"],
+      "allow_mixed_media": false,
+      "max_carousel_items": 5,
+      "caption_limit": 500,
+      "title_limit": 100,
+      "story_support": true,
+      "scheduling_support": true,
+      "video_requirements": {
+        "formats": ["mp4", "mov"],
+        "max_size_mb": 500,
+        "max_duration_sec": 900,
+        "recommended_aspect_ratio": "2:3_or_9:16"
+      },
+      "image_requirements": {
+        "formats": ["jpg", "jpeg", "png"],
+        "max_size_mb": 32,
+        "recommended_aspect_ratio": "2:3"
+      }
+    }
+  }
+}
