@@ -1,0 +1,112 @@
+{
+  "project": "salt-relay",
+  "updated_at": "2026-10-22T07:20:00Z",
+  "phase": "phase_a_cleanup",
+  "tasks": [
+    {
+      "id": "init_repo",
+      "title": "Create private GitHub repo salt-relay and initialize BUILD_STATE.json",
+      "status": "done",
+      "notes": "Repo created at https://github.com/motionssalt/salt-relay and git remote set."
+    },
+    {
+      "id": "inventory",
+      "title": "Enumerate GitHub and Cloudflare resources",
+      "status": "done",
+      "notes": "Full inventory cataloged across GitHub repos, Workers, Pages, D1, KV, R2."
+    },
+    {
+      "id": "cleanup_github",
+      "title": "Delete targeted deprecated GitHub repositories",
+      "status": "in_progress",
+      "notes": "Targeting exact 11 repos on DELETE list; keeping MotionSalt-Upscaler, bio, castcut, clipforge, forgebuild."
+    },
+    {
+      "id": "cleanup_workers",
+      "title": "Delete targeted deprecated Cloudflare Workers",
+      "status": "todo",
+      "notes": "Targeting exact 6 workers: forge, scriptura, motionsalt-compass, motionforge, accentura, lazyfonts."
+    },
+    {
+      "id": "cleanup_pages",
+      "title": "Delete targeted deprecated Cloudflare Pages projects",
+      "status": "todo",
+      "notes": "Targeting exact 1 Pages project: aurelia-miniapp."
+    },
+    {
+      "id": "cleanup_orphaned_storage",
+      "title": "Delete orphaned D1 databases and KV namespaces tied exclusively to deleted projects",
+      "status": "todo",
+      "notes": "Targeting motionforge, motionsalt_compass, accentura, scriptura-db, scriptura-membership, lazyfonts-sessions; leaving SESSION_KV untouched."
+    },
+    {
+      "id": "phase_b_cloudflare_resources",
+      "title": "Provision Cloudflare salt-relay-db (D1) and salt-relay-api (Worker)",
+      "status": "todo",
+      "notes": ""
+    },
+    {
+      "id": "phase_b_capabilities",
+      "title": "Define verified platform capabilities matrix (capabilities.json)",
+      "status": "todo",
+      "notes": "7 platforms: TikTok, YouTube, Threads, Instagram, X, Telegram, Pinterest."
+    },
+    {
+      "id": "phase_b_worker_backend",
+      "title": "Build salt-relay-api Cloudflare Worker & D1 schema/migrations",
+      "status": "todo",
+      "notes": "Includes single-user auth, AES-GCM encrypted Zernio keys, queue dispatcher, callback webhook, Drive folder resolver."
+    },
+    {
+      "id": "phase_b_github_actions",
+      "title": "Build GitHub Actions media processing & release rotation workflow",
+      "status": "todo",
+      "notes": "FFmpeg transcoding, image optimization, release asset upload, webhook callback."
+    },
+    {
+      "id": "phase_b_dashboard_ui",
+      "title": "Build mobile-first functional React dashboard UI",
+      "status": "todo",
+      "notes": "Composer, Accounts, Queue, History, Settings."
+    },
+    {
+      "id": "phase_b_deployment_and_verification",
+      "title": "Deploy and verify end-to-end functionality",
+      "status": "todo",
+      "notes": ""
+    }
+  ],
+  "decisions": [
+    "Strict preservation of KEEP list: motionssalt/bio, motionssalt/castcut, motionssalt/clipforge, and motionssalt/MotionSalt-Upscaler.",
+    "forgebuild and unlisted Cloudflare workers (aurelia-bot, aurelia-multipliers, motionsalt-bot, SESSION_KV) are kept untouched as per exact matching rules.",
+    "D1 database salt-relay-db to be provisioned via Cloudflare D1 API.",
+    "Worker salt-relay-api will orchestrate distribution, scheduling, and Zernio publishing."
+  ],
+  "cleanup": {
+    "deleted": [],
+    "not_found": [],
+    "skipped_with_reason": [
+      { "name": "bio", "type": "github_repo", "reason": "Explicit KEEP list (portfolio)" },
+      { "name": "castcut", "type": "github_repo", "reason": "Explicit KEEP list" },
+      { "name": "clipforge", "type": "github_repo", "reason": "Explicit KEEP list" },
+      { "name": "MotionSalt-Upscaler", "type": "github_repo", "reason": "Explicit KEEP list (protected anime upscaler)" },
+      { "name": "forgebuild", "type": "github_repo", "reason": "Not on DELETE list; left alone" },
+      { "name": "motionssalt-portfolio", "type": "cf_pages", "reason": "Explicit KEEP list" },
+      { "name": "castcut", "type": "cf_pages", "reason": "Explicit KEEP list" },
+      { "name": "clipforge-dashboard", "type": "cf_pages", "reason": "Explicit KEEP list" },
+      { "name": "aurelia-bot", "type": "cf_worker", "reason": "Not on DELETE list; left alone" },
+      { "name": "aurelia-multipliers", "type": "cf_worker", "reason": "Not on DELETE list; left alone" },
+      { "name": "motionsalt-bot", "type": "cf_worker", "reason": "Not on DELETE list; left alone" },
+      { "name": "SESSION_KV", "type": "cf_kv", "reason": "Shared or unverified owner; left alone" }
+    ],
+    "blocked": []
+  },
+  "resources": {
+    "d1_id": null,
+    "worker_url": null,
+    "pages_url": null,
+    "release_tags": []
+  },
+  "blockers": [],
+  "next_step": "Execute Phase A deletions on GitHub repos, CF Workers, CF Pages, and orphaned D1/KV storage."
+}

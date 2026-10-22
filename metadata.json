@@ -1,0 +1,6 @@
+{
+  "name": "Salt Relay",
+  "description": "Unified social publishing dashboard for scheduling, multi-media distribution, and automated delivery across TikTok, YouTube, Threads, Instagram, X, Telegram, and Pinterest.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
