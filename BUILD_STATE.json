@@ -1,7 +1,7 @@
 {
   "project": "salt-relay",
-  "updated_at": "2026-10-22T07:20:00Z",
-  "phase": "phase_a_cleanup",
+  "updated_at": "2026-10-22T07:21:00Z",
+  "phase": "phase_b_build",
   "tasks": [
     {
       "id": "init_repo",
@@ -18,32 +18,32 @@
     {
       "id": "cleanup_github",
       "title": "Delete targeted deprecated GitHub repositories",
-      "status": "in_progress",
-      "notes": "Targeting exact 11 repos on DELETE list; keeping MotionSalt-Upscaler, bio, castcut, clipforge, forgebuild."
+      "status": "done",
+      "notes": "Deleted 11 repos: aurelia-multipliers, motionsalt-compass, aurelia, motionsalt-headless, forge-sessions, anvil, accentura, motionforge, upscale, scriptura, lazyfonts."
     },
     {
       "id": "cleanup_workers",
       "title": "Delete targeted deprecated Cloudflare Workers",
-      "status": "todo",
-      "notes": "Targeting exact 6 workers: forge, scriptura, motionsalt-compass, motionforge, accentura, lazyfonts."
+      "status": "done",
+      "notes": "Deleted 6 workers: forge, scriptura, motionsalt-compass, motionforge, accentura, lazyfonts."
     },
     {
       "id": "cleanup_pages",
       "title": "Delete targeted deprecated Cloudflare Pages projects",
-      "status": "todo",
-      "notes": "Targeting exact 1 Pages project: aurelia-miniapp."
+      "status": "blocked",
+      "notes": "aurelia-miniapp blocked by Cloudflare API (code 8000076: 12,341 deployments require manual purge in UI)."
     },
     {
       "id": "cleanup_orphaned_storage",
       "title": "Delete orphaned D1 databases and KV namespaces tied exclusively to deleted projects",
-      "status": "todo",
-      "notes": "Targeting motionforge, motionsalt_compass, accentura, scriptura-db, scriptura-membership, lazyfonts-sessions; leaving SESSION_KV untouched."
+      "status": "done",
+      "notes": "Deleted 4 D1 databases (motionforge, motionsalt_compass, accentura, scriptura-db) and 2 KV namespaces (scriptura-membership, lazyfonts-sessions). Preserved SESSION_KV."
     },
     {
       "id": "phase_b_cloudflare_resources",
       "title": "Provision Cloudflare salt-relay-db (D1) and salt-relay-api (Worker)",
-      "status": "todo",
-      "notes": ""
+      "status": "in_progress",
+      "notes": "Provisioning D1 database salt-relay-db."
     },
     {
       "id": "phase_b_capabilities",
@@ -79,11 +79,36 @@
   "decisions": [
     "Strict preservation of KEEP list: motionssalt/bio, motionssalt/castcut, motionssalt/clipforge, and motionssalt/MotionSalt-Upscaler.",
     "forgebuild and unlisted Cloudflare workers (aurelia-bot, aurelia-multipliers, motionsalt-bot, SESSION_KV) are kept untouched as per exact matching rules.",
+    "aurelia-miniapp blocked from deletion due to CF API error 8000076 (12,341 historic deployments); reported in cleanup.blocked.",
     "D1 database salt-relay-db to be provisioned via Cloudflare D1 API.",
     "Worker salt-relay-api will orchestrate distribution, scheduling, and Zernio publishing."
   ],
   "cleanup": {
-    "deleted": [],
+    "deleted": [
+      { "name": "aurelia-multipliers", "type": "github_repo" },
+      { "name": "motionsalt-compass", "type": "github_repo" },
+      { "name": "aurelia", "type": "github_repo" },
+      { "name": "motionsalt-headless", "type": "github_repo" },
+      { "name": "forge-sessions", "type": "github_repo" },
+      { "name": "anvil", "type": "github_repo" },
+      { "name": "accentura", "type": "github_repo" },
+      { "name": "motionforge", "type": "github_repo" },
+      { "name": "upscale", "type": "github_repo" },
+      { "name": "scriptura", "type": "github_repo" },
+      { "name": "lazyfonts", "type": "github_repo" },
+      { "name": "forge", "type": "cf_worker" },
+      { "name": "scriptura", "type": "cf_worker" },
+      { "name": "motionsalt-compass", "type": "cf_worker" },
+      { "name": "motionforge", "type": "cf_worker" },
+      { "name": "accentura", "type": "cf_worker" },
+      { "name": "lazyfonts", "type": "cf_worker" },
+      { "name": "motionforge", "uuid": "99aacfe7-0a97-4697-b997-76a705e1ab00", "type": "cf_d1" },
+      { "name": "motionsalt_compass", "uuid": "602558fb-770e-465a-af53-c8747c54cee1", "type": "cf_d1" },
+      { "name": "accentura", "uuid": "f6a5b349-cf5b-454e-ad86-ccb138d3f67e", "type": "cf_d1" },
+      { "name": "scriptura-db", "uuid": "d50a7540-fe08-488f-aab0-3949373dd963", "type": "cf_d1" },
+      { "name": "scriptura-membership", "id": "1ea1721ee8fb4b1b98a8f02cfd98b617", "type": "cf_kv" },
+      { "name": "lazyfonts-sessions", "id": "cac79a1aef9f438bb3271d17d8bc0ae6", "type": "cf_kv" }
+    ],
     "not_found": [],
     "skipped_with_reason": [
       { "name": "bio", "type": "github_repo", "reason": "Explicit KEEP list (portfolio)" },
@@ -99,7 +124,14 @@
       { "name": "motionsalt-bot", "type": "cf_worker", "reason": "Not on DELETE list; left alone" },
       { "name": "SESSION_KV", "type": "cf_kv", "reason": "Shared or unverified owner; left alone" }
     ],
-    "blocked": []
+    "blocked": [
+      {
+        "name": "aurelia-miniapp",
+        "type": "cf_pages",
+        "status": 400,
+        "error": "Cloudflare error code 8000076: Project has 12,341 deployments. Cloudflare blocks project deletion until deployments are purged."
+      }
+    ]
   },
   "resources": {
     "d1_id": null,
@@ -108,5 +140,5 @@
     "release_tags": []
   },
   "blockers": [],
-  "next_step": "Execute Phase A deletions on GitHub repos, CF Workers, CF Pages, and orphaned D1/KV storage."
+  "next_step": "Create Cloudflare D1 salt-relay-db, define capabilities.json, build worker and dashboard."
 }
