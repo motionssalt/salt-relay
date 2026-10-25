@@ -646,7 +646,7 @@ export default {
     // -------------------------------------------------------------------------
     // PUBLIC STREAMING MEDIA PROXY (Allows Zernio to fetch release assets from private repo)
     // -------------------------------------------------------------------------
-    if (path.startsWith('/api/public/media/') && request.method === 'GET') {
+    if (path.startsWith('/api/public/media/') && (request.method === 'GET' || request.method === 'HEAD')) {
       const parts = path.replace('/api/public/media/', '').split('/');
       const jobId = parts[0];
       const assetName = decodeURIComponent(parts.slice(1).join('/'));
