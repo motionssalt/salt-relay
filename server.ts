@@ -516,10 +516,38 @@ app.post('/api/callback/media-processed', async (req, res) => {
       return res.status(403).json({ error: 'Invalid callback signature' });
     }
 
-    const { job_id, release_tag, media = [] } = req.body;
+    const { job_id, release_tag, media = [], status: pipelineStatus, error: pipelineError } = req.body;
     if (!job_id) return res.status(400).json({ error: 'job_id required' });
 
+    const existingJobs = await queryD1<any>('SELECT * FROM jobs WHERE id = ?', [job_id]);
+    if (!existingJobs || existingJobs.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    const currentJob = existingJobs[0];
+
+    // Never resurrect cancelled jobs
+    if (currentJob.status === 'cancelled') {
+      return res.json({ success: false, message: 'Job was cancelled by operator' });
+    }
+
     const now = new Date().toISOString();
+
+    // Accept late callback if failed by watchdog
+    if (currentJob.status === 'failed') {
+      await executeD1(
+        `UPDATE job_destinations SET status = 'pending', error_message = NULL, updated_at = ?
+         WHERE job_id = ? AND status = 'failed' AND (error_message LIKE '%timeout%' OR error_message IS NULL)`,
+        [now, job_id]
+      );
+    }
+
+    // Handle failure callback
+    if (pipelineStatus === 'failed') {
+      const errMsg = pipelineError || 'Pipeline error in GitHub Actions';
+      await executeD1(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`, [errMsg, now, job_id]);
+      await executeD1(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ?`, [errMsg, now, job_id]);
+      return res.json({ success: true, message: 'Failure recorded' });
+    }
 
     for (const m of media) {
       const mediaId = `media_${job_id}_${crypto.randomUUID().slice(0, 6)}`;
@@ -569,12 +597,17 @@ app.post('/api/callback/media-processed', async (req, res) => {
 // PUBLICATION DISTRIBUTION ENGINE
 // -----------------------------------------------------------------------------
 async function executePublicationStep(jobId: string) {
-  const now = new Date().toISOString();
-  await executeD1('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', ['publishing', now, jobId]);
-
   const jobs = await queryD1<any>('SELECT * FROM jobs WHERE id = ?', [jobId]);
   if (!jobs || jobs.length === 0) return;
   const job = jobs[0];
+
+  if (job.status === 'cancelled') {
+    console.log(`[Publication] Job ${jobId} was cancelled by operator. Aborting.`);
+    return;
+  }
+
+  const now = new Date().toISOString();
+  await executeD1('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', ['publishing', now, jobId]);
 
   const mediaAssets = await queryD1<any>('SELECT * FROM job_media WHERE job_id = ? AND status = ?', [jobId, 'processed']);
   const destinations = await queryD1<any>(

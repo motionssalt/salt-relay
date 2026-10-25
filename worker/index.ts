@@ -407,7 +407,7 @@ async function dispatchMediaWorkflow(env: Env, jobId: string, rawLinks: string[]
       headers: {
         'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
         'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'SaltRelay-Worker/1.0',
+        'User-Agent': 'SaltRelay-Worker/2.0',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -422,7 +422,43 @@ async function dispatchMediaWorkflow(env: Env, jobId: string, rawLinks: string[]
     });
 
     if (res.status === 204 || (res.status >= 200 && res.status < 300)) {
-      await logJobEvent(env.DB, jobId, 'dispatched', 'info', 'GitHub Actions media processing workflow dispatched successfully.');
+      let runId: string | null = null;
+      let runUrl: string | null = null;
+
+      try {
+        // Brief pause to allow GitHub to register the dispatched workflow run
+        await new Promise(r => setTimeout(r, 1500));
+        const runsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/process-media.yml/runs?event=workflow_dispatch&per_page=5`, {
+          headers: {
+            'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'SaltRelay-Worker/2.0'
+          }
+        });
+        if (runsRes.ok) {
+          const runsData = await runsRes.json() as any;
+          const runs = runsData.workflow_runs || [];
+          const recentRun = runs[0];
+          if (recentRun && recentRun.id) {
+            runId = String(recentRun.id);
+            runUrl = recentRun.html_url;
+            await env.DB.prepare(
+              `UPDATE jobs SET workflow_run_id = ?, workflow_run_url = ? WHERE id = ?`
+            ).bind(runId, runUrl, jobId).run();
+          }
+        }
+      } catch (findErr: any) {
+        console.warn('Could not immediately identify workflow run ID:', findErr.message);
+      }
+
+      await logJobEvent(
+        env.DB,
+        jobId,
+        'dispatched',
+        'info',
+        runUrl ? `GitHub Actions workflow dispatched. Run #${runId} active.` : 'GitHub Actions media processing workflow dispatched successfully.',
+        runId ? { run_id: runId, run_url: runUrl } : undefined
+      );
       return { success: true };
     }
 
@@ -441,12 +477,18 @@ async function dispatchMediaWorkflow(env: Env, jobId: string, rawLinks: string[]
 // FULL PUBLICATION EXECUTION ENGINE (Per-destination tracking, idempotency, retry)
 // -----------------------------------------------------------------------------
 async function executePublicationStep(env: Env, jobId: string): Promise<void> {
+  const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first<any>();
+  if (!job) return;
+
+  // Never publish or resurrect cancelled jobs
+  if (job.status === 'cancelled') {
+    console.log(`[Publication] Job ${jobId} was cancelled by operator. Aborting publication.`);
+    return;
+  }
+
   const now = new Date().toISOString();
   await env.DB.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').bind('publishing', now, jobId).run();
   await logJobEvent(env.DB, jobId, 'publishing', 'info', 'Commencing social platform publication via Zernio.');
-
-  const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first<any>();
-  if (!job) return;
 
   const mediaAssetsRes = await env.DB.prepare('SELECT * FROM job_media WHERE job_id = ? AND status = ?').bind(jobId, 'processed').all<any>();
   const mediaAssets = mediaAssetsRes.results || [];
@@ -648,10 +690,18 @@ export default {
               headers: {
                 'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
                 'Accept': 'application/octet-stream',
-                'User-Agent': 'SaltRelay-Worker/1.0'
+                'User-Agent': 'SaltRelay-Worker/2.0'
               },
-              redirect: 'follow'
+              redirect: 'manual'
             });
+
+            // If GitHub redirected to signed CDN (AWS S3 / Azure blob), forward client directly
+            if (assetRes.status >= 300 && assetRes.status < 400) {
+              const redirectLocation = assetRes.headers.get('Location');
+              if (redirectLocation) {
+                return Response.redirect(redirectLocation, 302);
+              }
+            }
 
             const contentType = media.file_type === 'video' ? 'video/mp4' : 'image/jpeg';
             return new Response(assetRes.body, {
@@ -748,7 +798,59 @@ export default {
       const jobId = body.job_id;
       if (!jobId) return jsonResponse({ error: 'job_id required' }, 400, {}, request);
 
+      const job = await env.DB.prepare('SELECT id, status, error_message FROM jobs WHERE id = ?').bind(jobId).first<any>();
+      if (!job) {
+        return jsonResponse({ error: 'Job not found' }, 404, {}, request);
+      }
+
+      // 1. Refuse to resurrect cancelled jobs
+      if (job.status === 'cancelled') {
+        console.warn(`[Callback] Job ${jobId} was cancelled by operator. Ignoring callback and not resurrecting.`);
+        await logJobEvent(env.DB, jobId, 'callback_ignored', 'warn', 'Callback received for cancelled job; discarded.');
+        return jsonResponse({ success: false, message: 'Job was cancelled by operator' }, 200, {}, request);
+      }
+
       const now = new Date().toISOString();
+
+      // 2. Accept late signed callbacks for jobs previously failed by watchdog (F1)
+      const isLateCallback = job.status === 'failed';
+      if (isLateCallback) {
+        console.log(`[Callback] Valid signed late callback arrived for watchdog-failed job ${jobId}. Resuming publication.`);
+        await logJobEvent(
+          env.DB,
+          jobId,
+          'late_callback_accepted',
+          'info',
+          `Late signed callback accepted. Resuming job that was previously timed out by watchdog.`
+        );
+        // Reset destination statuses to pending
+        await env.DB.prepare(
+          `UPDATE job_destinations SET status = 'pending', error_message = NULL, updated_at = ?
+           WHERE job_id = ? AND status = 'failed' AND (error_message LIKE '%timeout%' OR error_message IS NULL)`
+        ).bind(now, jobId).run();
+      }
+
+      // 3. Handle pipeline failure reported from GitHub Actions runner
+      if (body.status === 'failed' || (body.failed_count > 0 && body.processed_count === 0)) {
+        const failureReason = body.error || `Media pipeline processing error in stage ${body.stage || 'pipeline'}`;
+        await env.DB.prepare(
+          `UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`
+        ).bind(failureReason, now, jobId).run();
+
+        await env.DB.prepare(
+          `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ?
+           WHERE job_id = ? AND status IN ('pending', 'publishing')`
+        ).bind(failureReason, now, jobId).run();
+
+        await logJobEvent(env.DB, jobId, 'transcode_failed', 'error', failureReason, {
+          stage: body.stage || 'pipeline',
+          error: failureReason
+        });
+
+        return jsonResponse({ success: true, message: 'Pipeline failure recorded' }, 200, {}, request);
+      }
+
+      // 4. Record processed media assets
       const mediaList = body.media || [];
 
       for (const m of mediaList) {
@@ -1244,30 +1346,123 @@ export default {
     const nowIso = now.toISOString();
     console.log(`[Watchdog & Cron] Heartbeat triggered at ${nowIso}`);
 
-    // 1. WATCHDOG: Find jobs stuck in pending/processing/publishing for > 15 minutes
+    // 1. INTELLIGENT WATCHDOG: Track real GitHub Actions run state instead of blind timer (F3)
     try {
-      const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-      const stuckJobs = await env.DB.prepare(
-        `SELECT id, status, updated_at FROM jobs
-         WHERE status IN ('pending', 'processing', 'publishing')
+      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      const activeJobs = await env.DB.prepare(
+        `SELECT id, status, caption, created_at, updated_at, workflow_run_id, workflow_run_url FROM jobs
+         WHERE status IN ('pending', 'processing')
            AND updated_at <= ?
          LIMIT 10`
-      ).bind(fifteenMinutesAgo).all<any>();
+      ).bind(tenMinutesAgo).all<any>();
 
-      for (const job of (stuckJobs.results || [])) {
-        console.warn(`[Watchdog] Terminating stuck job: ${job.id} (Status: ${job.status}, Updated: ${job.updated_at})`);
-        const reason = `Watchdog timeout: job remained in '${job.status}' stage for over 15 minutes without progress.`;
+      for (const job of (activeJobs.results || [])) {
+        const createdAtMs = new Date(job.created_at).getTime();
+        const elapsedMinutes = Math.floor((Date.now() - createdAtMs) / (60 * 1000));
+        const owner = env.GITHUB_OWNER || 'motionssalt';
+        const repo = env.GITHUB_REPO || 'salt-relay';
 
-        await env.DB.prepare(
-          `UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`
-        ).bind(reason, nowIso, job.id).run();
+        // Check if we have an active GitHub Actions run to inspect
+        if (job.workflow_run_id && env.GITHUB_PAT) {
+          try {
+            const runRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/runs/${job.workflow_run_id}`, {
+              headers: {
+                'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'SaltRelay-Worker/2.0'
+              }
+            });
 
-        await env.DB.prepare(
-          `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ?
-           WHERE job_id = ? AND status IN ('pending', 'publishing')`
-        ).bind('Terminated due to pipeline timeout', nowIso, job.id).run();
+            if (runRes.ok) {
+              const runData = await runRes.json() as any;
+              const runStatus = runData.status; // 'queued', 'in_progress', 'completed'
+              const runConclusion = runData.conclusion; // 'success', 'failure', 'cancelled', 'timed_out', etc.
+              const runUrl = runData.html_url || job.workflow_run_url;
 
-        await logJobEvent(env.DB, job.id, 'watchdog_timeout', 'error', reason);
+              // Case A: Workflow run is actively queued or in progress
+              if (runStatus === 'queued' || runStatus === 'in_progress') {
+                if (elapsedMinutes < 45) {
+                  console.log(`[Watchdog] Job ${job.id}: GitHub run #${job.workflow_run_id} is active (${runStatus}). Elapsed: ${elapsedMinutes}m. Extending deadline.`);
+                  await env.DB.prepare(`UPDATE jobs SET updated_at = ? WHERE id = ?`).bind(nowIso, job.id).run();
+                  await logJobEvent(
+                    env.DB,
+                    job.id,
+                    'watchdog_extended',
+                    'info',
+                    `Workflow run #${job.workflow_run_id} is currently ${runStatus} in GitHub Actions (${elapsedMinutes}m elapsed). Deadline extended.`,
+                    { run_url: runUrl, elapsed_minutes: elapsedMinutes }
+                  );
+                  continue;
+                } else {
+                  // Exceeded 45-minute hard limit
+                  const reason = `Watchdog timeout: GitHub Actions run #${job.workflow_run_id} exceeded 45-minute hard limit. Inspect run: ${runUrl}`;
+                  await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
+                    .bind(reason, nowIso, job.id).run();
+                  await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
+                    .bind('Terminated due to 45m hard timeout', nowIso, job.id).run();
+                  await logJobEvent(env.DB, job.id, 'watchdog_timeout', 'error', reason, { run_url: runUrl });
+                  continue;
+                }
+              }
+
+              // Case B: Workflow run completed
+              if (runStatus === 'completed') {
+                if (runConclusion === 'failure' || runConclusion === 'timed_out') {
+                  const reason = `GitHub Actions processing failed (${runConclusion}). Inspect run log: ${runUrl}`;
+                  await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
+                    .bind(reason, nowIso, job.id).run();
+                  await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
+                    .bind(`Media transcode failed in GitHub Actions: ${runConclusion}`, nowIso, job.id).run();
+                  await logJobEvent(env.DB, job.id, 'transcode_failed', 'error', reason, { run_url: runUrl, conclusion: runConclusion });
+                  continue;
+                } else if (runConclusion === 'cancelled') {
+                  const reason = `GitHub Actions run was cancelled. Inspect run: ${runUrl}`;
+                  await env.DB.prepare(`UPDATE jobs SET status = 'cancelled', error_message = ?, updated_at = ? WHERE id = ?`)
+                    .bind(reason, nowIso, job.id).run();
+                  await logJobEvent(env.DB, job.id, 'cancelled', 'warn', reason, { run_url: runUrl });
+                  continue;
+                } else if (runConclusion === 'success') {
+                  // Run completed successfully, but no callback received
+                  const runUpdated = new Date(runData.updated_at || runData.created_at).getTime();
+                  const sinceRunEndMin = Math.floor((Date.now() - runUpdated) / (60 * 1000));
+                  if (sinceRunEndMin >= 3) {
+                    const reason = `GitHub Actions processing finished successfully, but callback was never received by Worker. Inspect run: ${runUrl}. Retry available.`;
+                    await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
+                      .bind(reason, nowIso, job.id).run();
+                    await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
+                      .bind('Callback never received from GitHub Actions', nowIso, job.id).run();
+                    await logJobEvent(env.DB, job.id, 'callback_missing', 'error', reason, { run_url: runUrl });
+                    continue;
+                  }
+                }
+              }
+            }
+          } catch (ghCheckErr: any) {
+            console.warn(`[Watchdog] Error querying GitHub run #${job.workflow_run_id}:`, ghCheckErr.message);
+          }
+        }
+
+        // Fallback for jobs without workflow run ID: use 30-minute threshold
+        if (elapsedMinutes >= 30) {
+          const reason = `Watchdog timeout: job remained in '${job.status}' for ${elapsedMinutes} minutes without progress.`;
+          await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
+            .bind(reason, nowIso, job.id).run();
+          await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
+            .bind('Terminated due to 30m watchdog timeout', nowIso, job.id).run();
+          await logJobEvent(env.DB, job.id, 'watchdog_timeout', 'error', reason);
+        }
+      }
+
+      // Also check publishing jobs stuck for > 20 minutes
+      const stuckPublishing = await env.DB.prepare(
+        `SELECT id, status, updated_at FROM jobs WHERE status = 'publishing' AND updated_at <= ? LIMIT 5`
+      ).bind(new Date(Date.now() - 20 * 60 * 1000).toISOString()).all<any>();
+
+      for (const job of (stuckPublishing.results || [])) {
+        const reason = `Publication timeout: job remained in 'publishing' status for over 20 minutes.`;
+        await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
+          .bind(reason, nowIso, job.id).run();
+        await logJobEvent(env.DB, job.id, 'publishing_timeout', 'error', reason);
       }
     } catch (watchdogErr) {
       console.error('[Watchdog] Error running timeout checks:', watchdogErr);

@@ -74,6 +74,8 @@ export interface Job {
   published_at?: string;
   timezone: string;
   error_message?: string;
+  workflow_run_id?: string;
+  workflow_run_url?: string;
   created_at: string;
   updated_at: string;
   destinations?: JobDestination[];

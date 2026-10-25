@@ -15,20 +15,31 @@ Salt Relay is an automated, mobile-first social media scheduling, media distribu
 
 ---
 
-## 2. Pipeline Stages & Where to Look When a Job Stalls
+## 2. Pipeline Stages & Troubleshooting Guide
 
-Salt Relay writes stage-by-stage events to `job_events` and `execution_logs` in Cloudflare D1. Every job transition is visible in the UI under **Job History & Destinations** -> Click any job to inspect the **Event Timeline**:
+Salt Relay writes stage-by-stage events to `job_events` and `execution_logs` in Cloudflare D1. Every job transition is visible in the UI under **Job History & Destinations** -> Click any job to inspect the **Event Timeline** and direct **Run Log** link.
+
+### Where to Look When a Job Stalls or Fails
+
+1. **Job Details & Run Log Link**: Click the job in the dashboard history. If a GitHub Actions transcode run was initiated, a direct **"View Run Log"** link points straight to the specific GitHub Actions execution (`https://github.com/motionssalt/salt-relay/actions/runs/<id>`).
+2. **Job Event Timeline**: In the job drawer, scroll down to the **Event Timeline**. Each step logs timestamp, stage, and details (e.g., `dispatched`, `watchdog_extended`, `transcoded`, `publishing`, `dest_published`, `dest_failed`).
+3. **Late Callback Acceptance**: If a job was marked failed due to a temporary watchdog timeout while a long run was still progressing, the Worker automatically accepts the signed late callback when the runner finishes, recovers the job, and proceeds with publishing to unfulfilled destinations.
+4. **Idempotent Retry**: If any destinations failed (e.g. rate limit, expired API key, network blip), click the **"Retry"** button on the job card or detail view. Only unfulfilled destinations are dispatched; already-published platforms are never duplicated.
+
+### Stage Reference
 
 | Stage | What Happens | Where to Look If Stalled |
 | :--- | :--- | :--- |
 | `created` | Post record and per-destination tracking rows inserted into D1. | Check `/api/jobs` and `job_destinations` in D1. |
-| `dispatching` / `dispatched` | Worker calls GitHub Actions `workflow_dispatch` on `process-media.yml`. | Verify Worker has valid `GITHUB_PAT` secret with `repo`+`workflow` scopes. |
-| `transcoding` | GitHub Actions runner downloads media (Drive / direct link) and transcodes via FFmpeg. | GitHub repository **Actions** tab -> `process-media` workflow run logs. |
-| `uploaded` | Runner uploads transcoded media to temporary GitHub Release asset. | GitHub repository **Releases** tab (`media-001`). |
-| `publishing` | Runner posts signed callback to `/api/callback/media-processed`, Worker starts Zernio dispatch. | Check `CALLBACK_SECRET` match between Worker & Actions. Check Zernio API response in `job_events`. |
+| `dispatching` / `dispatched` | Worker calls GitHub Actions `workflow_dispatch` on `process-media.yml`, captures workflow run ID & URL. | Verify Worker has valid `GITHUB_PAT` secret with `repo`+`workflow` scopes. |
+| `transcoding` | GitHub Actions runner downloads media (Drive / direct link) and transcodes via static FFmpeg binary. | Click "View Run Log" in the job details to inspect real-time transcode progress. |
+| `uploaded` | Runner uploads transcoded media to temporary GitHub Release asset (`media-001`) with HTTP verification. | GitHub repository **Releases** tab (`media-001`). Runner verifies asset presence via API. |
+| `publishing` | Runner posts signed HMAC webhook to `/api/callback/media-processed`, Worker starts Zernio dispatch. | Check `CALLBACK_SECRET` match between Worker & Actions. Check Zernio API response in `job_events`. |
 | `published` / `partially_published` | Zernio confirms publication to social platforms. External IDs & URLs recorded. | View Destination Breakdown in the dashboard or click external post links. |
-| `failed` | Error recorded with exact failure reason from platform or transcode. | Click "Retry Unfulfilled Destinations" to re-dispatch safely without duplicating published posts. |
-| `watchdog_timeout` | Watchdog detects job stuck > 15 minutes and marks it failed with explanation. | Inspect cron logs in Worker and retry unfulfilled destinations. |
+| `failed` | Error recorded with exact failure reason from platform or transcode runner. | Check error banner; click "Retry" to re-attempt unfulfilled destinations safely. |
+| `watchdog_extended` | Watchdog inspected GitHub Actions run, confirmed it is actively `queued` or `in_progress`, and extended the deadline. | Normal behavior for longer media files. The hard limit is 45 minutes. |
+| `watchdog_timeout` | Run exceeded 45-minute hard limit or orphan job had no activity for > 30 minutes. | Check the GitHub run link on the job card to see if runner stalled. |
+| `cancelled` | Operator explicitly cancelled the job. Cancelled jobs are permanently sealed and never auto-resurrect. | Marked by operator action in dashboard. |
 
 ---
 
