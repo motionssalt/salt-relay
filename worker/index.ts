@@ -894,6 +894,35 @@ export default {
     }
 
     // -------------------------------------------------------------------------
+    // CRON & DISPATCH TRIGGER (Authenticated with GITHUB_PAT)
+    // -------------------------------------------------------------------------
+    if (path === '/api/public/trigger-scheduled' && request.method === 'POST') {
+      const authHeader = request.headers.get('Authorization') || '';
+      const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+      if (env.GITHUB_PAT && constantTimeCompare(token, env.GITHUB_PAT.trim())) {
+        await this.scheduled({ scheduledTime: Date.now(), cron: 'manual' }, env, ctx);
+        return jsonResponse({ success: true, message: 'Scheduled cron & watchdog execution concluded' }, 200, {}, request);
+      }
+      return jsonResponse({ error: 'Unauthorized' }, 401, {}, request);
+    }
+
+    if (path.startsWith('/api/public/dispatch-job/') && request.method === 'POST') {
+      const authHeader = request.headers.get('Authorization') || '';
+      const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+      if (env.GITHUB_PAT && constantTimeCompare(token, env.GITHUB_PAT.trim())) {
+        const jobId = path.replace('/api/public/dispatch-job/', '');
+        const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first<any>();
+        if (!job) return jsonResponse({ error: 'Job not found' }, 404, {}, request);
+        let links: string[] = [];
+        try { links = JSON.parse(job.raw_links_json || '[]'); } catch {}
+        await env.DB.prepare('UPDATE jobs SET status = "processing", updated_at = ? WHERE id = ?').bind(new Date().toISOString(), jobId).run();
+        const dispatchRes = await dispatchMediaWorkflow(env, jobId, links);
+        return jsonResponse({ success: dispatchRes.success, error: dispatchRes.error }, dispatchRes.success ? 200 : 500, {}, request);
+      }
+      return jsonResponse({ error: 'Unauthorized' }, 401, {}, request);
+    }
+
+    // -------------------------------------------------------------------------
     // AUTH GUARD: ALL SUBSEQUENT /api ROUTES STRICTLY REQUIRE AUTHENTICATION
     // -------------------------------------------------------------------------
     const sessionToken = extractSessionToken(request);
