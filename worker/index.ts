@@ -1,7 +1,7 @@
 /**
  * Salt Relay Cloudflare Worker API & Orchestration Engine
  * Deployed to Cloudflare Workers as `salt-relay-api`
- * Binds: D1 Database `DB`, Cron Trigger `* /5 * * * *`
+ * Binds: D1 Database `DB`, Cron Trigger (every 5 minutes)
  */
 
 import crypto from 'node:crypto';
@@ -48,6 +48,17 @@ export interface Env {
   APP_URL?: string;
 }
 
+export type SourceKind = 'direct_url' | 'drive_file' | 'drive_folder';
+
+export interface ValidatedSource {
+  position: number;
+  source_url: string;
+  source_kind: SourceKind;
+}
+
+const LEGACY_NO_SOURCES_MESSAGE =
+  "This job's original media links were not saved, so it cannot be retried. Create a new post.";
+
 // -----------------------------------------------------------------------------
 // CORS & HEADERS
 // -----------------------------------------------------------------------------
@@ -89,6 +100,23 @@ function jsonResponse(data: any, status = 200, extraHeaders: Record<string, stri
   });
 }
 
+function scrubSecrets(text: string, env: Env): string {
+  let out = String(text || '');
+  const candidates = [
+    env.GITHUB_PAT,
+    env.CALLBACK_SECRET,
+    env.ENCRYPTION_KEY,
+    env.DASHBOARD_PASSWORD,
+    env.SESSION_SECRET
+  ].filter((s): s is string => Boolean(s && s.trim().length >= 6));
+  for (const sec of candidates) {
+    out = out.split(sec.trim()).join('[REDACTED]');
+  }
+  out = out.replace(/github_pat_[A-Za-z0-9_]+/g, '[REDACTED_PAT]');
+  out = out.replace(/gh[pousr]_[A-Za-z0-9_]+/g, '[REDACTED_PAT]');
+  return out;
+}
+
 // -----------------------------------------------------------------------------
 // CRYPTO & AUTH UTILITIES (Constant-time, Salted Hashing, Session Cookies)
 // -----------------------------------------------------------------------------
@@ -96,7 +124,6 @@ function constantTimeCompare(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'utf8');
   const bufB = Buffer.from(b, 'utf8');
   if (bufA.length !== bufB.length) {
-    // Perform dummy comparison to mitigate timing attacks
     crypto.timingSafeEqual(bufA, bufA);
     return false;
   }
@@ -106,7 +133,6 @@ function constantTimeCompare(a: string, b: string): boolean {
 function verifyPassword(candidate: string, env: Env): boolean {
   if (!candidate || typeof candidate !== 'string') return false;
 
-  // 1. If PBKDF2 hash is configured in Worker secrets: format "pbkdf2:100000:<salt_hex>:<hash_hex>"
   if (env.DASHBOARD_PASSWORD_HASH) {
     const parts = env.DASHBOARD_PASSWORD_HASH.split(':');
     if (parts.length === 4 && parts[0] === 'pbkdf2') {
@@ -118,12 +144,10 @@ function verifyPassword(candidate: string, env: Env): boolean {
     }
   }
 
-  // 2. If plain secret is configured in Worker secrets
   if (env.DASHBOARD_PASSWORD) {
     return constantTimeCompare(candidate.trim(), env.DASHBOARD_PASSWORD.trim());
   }
 
-  // Never fall back to a hardcoded password. If not configured, reject.
   return false;
 }
 
@@ -140,7 +164,7 @@ function createSignedSessionToken(env: Env): string {
   const payload = {
     sub: 'operator',
     iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30, // 30 days
+    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30,
     nonce: crypto.randomBytes(8).toString('hex')
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -168,17 +192,14 @@ function verifySessionToken(token: string, env: Env): boolean {
 }
 
 function extractSessionToken(request: Request): string {
-  // 1. Authorization: Bearer <token>
   const authHeader = request.headers.get('Authorization');
   if (authHeader && /^Bearer\s+/i.test(authHeader)) {
     return authHeader.replace(/^Bearer\s+/i, '').trim();
   }
 
-  // 2. X-Session-Token header
   const customHeader = request.headers.get('X-Session-Token');
   if (customHeader) return customHeader.trim();
 
-  // 3. HttpOnly Cookie: salt_relay_session=<token>
   const cookieHeader = request.headers.get('Cookie') || '';
   const match = cookieHeader.match(/salt_relay_session=([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)/);
   if (match) return match[1];
@@ -222,7 +243,7 @@ async function recordFailedAuthAttempt(db: D1Database, ip: string): Promise<void
     const current = (row?.failed_attempts || 0) + 1;
     let lockedUntil: string | null = null;
     if (current >= 5) {
-      lockedUntil = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15-minute lockout
+      lockedUntil = new Date(Date.now() + 15 * 60 * 1000).toISOString();
     }
 
     await db.prepare(
@@ -249,7 +270,14 @@ async function resetAuthRateLimit(db: D1Database, ip: string): Promise<void> {
 // -----------------------------------------------------------------------------
 // EVENT LOGGING (job_events & execution_logs)
 // -----------------------------------------------------------------------------
-async function logJobEvent(db: D1Database, jobId: string, stage: string, level: 'info' | 'warn' | 'error', message: string, details?: any): Promise<void> {
+async function logJobEvent(
+  db: D1Database,
+  jobId: string,
+  stage: string,
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  details?: any
+): Promise<void> {
   const now = new Date().toISOString();
   const eventId = `evt_${crypto.randomUUID().slice(0, 10)}`;
   const detailsStr = details ? (typeof details === 'string' ? details : JSON.stringify(details)) : null;
@@ -260,7 +288,6 @@ async function logJobEvent(db: D1Database, jobId: string, stage: string, level: 
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).bind(eventId, jobId, stage, level, message, detailsStr, now).run();
   } catch (e) {
-    // If table doesn't exist yet, fallback gracefully
     console.warn('Failed to insert job_events row:', e);
   }
 
@@ -272,6 +299,322 @@ async function logJobEvent(db: D1Database, jobId: string, stage: string, level: 
   } catch (e) {
     console.warn('Failed to insert execution_logs row:', e);
   }
+}
+
+// -----------------------------------------------------------------------------
+// SOURCE VALIDATION, IMMUTABLE PERSISTENCE & SCHEDULE HELPERS (F5 & F6)
+// -----------------------------------------------------------------------------
+export function classifySourceUrl(rawUrl: string): { valid: boolean; kind?: SourceKind; reason?: string } {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { valid: false, reason: `Malformed URL syntax '${rawUrl}'. Must start with https:// or http://.` };
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return { valid: false, reason: `Unsupported protocol '${parsed.protocol}' in '${rawUrl}'. Only https:// and http:// URLs are supported.` };
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (!host.includes('.') && host !== 'localhost' && host !== '127.0.0.1') {
+    return { valid: false, reason: `Invalid hostname '${parsed.hostname}' in '${rawUrl}'.` };
+  }
+
+  if (host === 'drive.google.com' || host.endsWith('.drive.google.com') || host === 'drive.usercontent.google.com') {
+    const full = parsed.toString();
+    if (full.includes('/folders/')) {
+      const folderMatch = full.match(/\/folders\/([a-zA-Z0-9_-]{8,})/);
+      if (!folderMatch) {
+        return {
+          valid: false,
+          reason: `Google Drive folder link '${rawUrl}' is missing a valid folder ID (expected https://drive.google.com/drive/folders/<ID>).`
+        };
+      }
+      return { valid: true, kind: 'drive_folder' };
+    }
+
+    const fileMatch = full.match(/(?:\/file\/d\/|[?&]id=)([a-zA-Z0-9_-]{8,})/);
+    if (fileMatch) {
+      return { valid: true, kind: 'drive_file' };
+    }
+
+    return {
+      valid: false,
+      reason: `Google Drive URL '${rawUrl}' does not contain a specific file ID or folder ID. Share a public folder (/drive/folders/<ID>) or file (/file/d/<ID>) link.`
+    };
+  }
+
+  return { valid: true, kind: 'direct_url' };
+}
+
+export function validateSubmittedSources(rawInput: unknown): {
+  valid: boolean;
+  sources: ValidatedSource[];
+  error?: string;
+  field?: string;
+  stage?: string;
+} {
+  const arr = Array.isArray(rawInput) ? rawInput : [];
+  const trimmedList = arr
+    .map(item => (typeof item === 'string' ? item.trim() : (item && typeof (item as any).url === 'string' ? (item as any).url.trim() : '')))
+    .filter(s => s.length > 0);
+
+  if (trimmedList.length === 0) {
+    return {
+      valid: false,
+      sources: [],
+      stage: 'create_validation',
+      field: 'links',
+      error: 'Validation failed [stage: create_validation, field: links]: At least one media source link (direct image/video URL or public Google Drive file/folder link) is required.'
+    };
+  }
+
+  const validated: ValidatedSource[] = [];
+  for (let i = 0; i < trimmedList.length; i++) {
+    const url = trimmedList[i];
+    const check = classifySourceUrl(url);
+    if (!check.valid || !check.kind) {
+      return {
+        valid: false,
+        sources: [],
+        stage: 'create_validation',
+        field: `links[${i}]`,
+        error: `Validation failed [stage: create_validation, field: links[${i}]]: ${check.reason}`
+      };
+    }
+    validated.push({
+      position: i,
+      source_url: url,
+      source_kind: check.kind
+    });
+  }
+
+  return { valid: true, sources: validated };
+}
+
+async function ensureJobSourcesTable(db: D1Database): Promise<void> {
+  try {
+    await db.prepare(
+      `CREATE TABLE IF NOT EXISTS job_sources (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        source_url TEXT NOT NULL,
+        source_kind TEXT NOT NULL DEFAULT 'direct_url',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+      )`
+    ).run();
+  } catch (e) {
+    console.warn('ensureJobSourcesTable warning:', e);
+  }
+}
+
+async function saveImmutableJobSources(
+  db: D1Database,
+  jobId: string,
+  sources: ValidatedSource[],
+  createdAt: string
+): Promise<void> {
+  await ensureJobSourcesTable(db);
+  for (const src of sources) {
+    await db.prepare(
+      `INSERT OR IGNORE INTO job_sources (id, job_id, position, source_url, source_kind, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(`src_${jobId}_${src.position}`, jobId, src.position, src.source_url, src.source_kind, createdAt).run();
+  }
+}
+
+async function resolveOrRecoverJobSources(
+  db: D1Database,
+  job: any
+): Promise<{ sources: ValidatedSource[]; recovered: boolean }> {
+  await ensureJobSourcesTable(db);
+
+  // 1. Primary source of truth: immutable job_sources rows
+  try {
+    const rowsRes = await db.prepare(
+      'SELECT position, source_url, source_kind FROM job_sources WHERE job_id = ? ORDER BY position ASC'
+    ).bind(job.id).all<any>();
+    const rows = rowsRes.results || [];
+    if (rows.length > 0) {
+      return {
+        sources: rows.map((r, idx) => ({
+          position: typeof r.position === 'number' ? r.position : idx,
+          source_url: r.source_url,
+          source_kind: (r.source_kind || 'direct_url') as SourceKind
+        })),
+        recovered: false
+      };
+    }
+  } catch (e) {
+    console.warn('Error reading job_sources:', e);
+  }
+
+  // 2. Fallback & recovery from jobs.sources_json or jobs.raw_links_json
+  const candidates: string[] = [];
+  for (const colVal of [job.sources_json, job.raw_links_json]) {
+    if (typeof colVal === 'string' && colVal.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(colVal);
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            const u = typeof item === 'string' ? item.trim() : (item?.url || '').trim();
+            if (u) candidates.push(u);
+          }
+        }
+      } catch {}
+    }
+    if (candidates.length > 0) break;
+  }
+
+  // 3. Secondary legacy recovery: inspect job_events or execution_logs details_json
+  if (candidates.length === 0) {
+    try {
+      const logsRes = await db.prepare(
+        `SELECT details_json FROM execution_logs WHERE job_id = ? AND details_json IS NOT NULL ORDER BY created_at ASC`
+      ).bind(job.id).all<any>();
+      for (const row of (logsRes.results || [])) {
+        try {
+          const d = JSON.parse(row.details_json);
+          const list = d?.links || d?.sources;
+          if (Array.isArray(list) && list.length > 0) {
+            for (const u of list) {
+              if (typeof u === 'string' && u.trim()) candidates.push(u.trim());
+            }
+            if (candidates.length > 0) break;
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  if (candidates.length === 0) {
+    return { sources: [], recovered: false };
+  }
+
+  const check = validateSubmittedSources(candidates);
+  if (!check.valid || check.sources.length === 0) {
+    return { sources: [], recovered: false };
+  }
+
+  // Persist recovered sources immutably into job_sources & jobs.sources_json
+  const now = new Date().toISOString();
+  await saveImmutableJobSources(db, job.id, check.sources, job.created_at || now);
+  try {
+    await db.prepare('UPDATE jobs SET sources_json = ? WHERE id = ?')
+      .bind(JSON.stringify(check.sources.map(s => s.source_url)), job.id)
+      .run();
+  } catch {}
+
+  return { sources: check.sources, recovered: true };
+}
+
+export function normalizeScheduleToUtcIso(rawSchedule: string | undefined | null, timezone = 'Africa/Lagos'): {
+  valid: boolean;
+  iso: string | null;
+  error?: string;
+} {
+  if (!rawSchedule || typeof rawSchedule !== 'string' || !rawSchedule.trim()) {
+    return { valid: false, iso: null, error: 'Scheduled date/time is missing.' };
+  }
+
+  const trimmed = rawSchedule.trim();
+
+  // Already carries explicit UTC Z or numeric offset
+  if (/Z$/i.test(trimmed) || /[+-]\d{2}:\d{2}$/.test(trimmed)) {
+    const dt = new Date(trimmed);
+    if (Number.isNaN(dt.getTime())) {
+      return { valid: false, iso: null, error: `Invalid scheduled_at timestamp '${trimmed}'.` };
+    }
+    return { valid: true, iso: dt.toISOString() };
+  }
+
+  // Naive datetime-local format YYYY-MM-DDTHH:mm or YYYY-MM-DDTHH:mm:ss
+  const m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) {
+    const fallbackDt = new Date(trimmed);
+    if (!Number.isNaN(fallbackDt.getTime())) {
+      return { valid: true, iso: fallbackDt.toISOString() };
+    }
+    return { valid: false, iso: null, error: `Invalid scheduled_at format '${trimmed}' (expected ISO-8601 or YYYY-MM-DDTHH:mm).` };
+  }
+
+  const [, yStr, moStr, dStr, hStr, miStr, sStr] = m;
+  const year = Number(yStr);
+  const month = Number(moStr);
+  const day = Number(dStr);
+  const hour = Number(hStr);
+  const minute = Number(miStr);
+  const second = Number(sStr || '0');
+
+  if (timezone === 'Africa/Lagos') {
+    // Africa/Lagos is UTC+01:00 year-round (WAT, no DST)
+    const utcMs = Date.UTC(year, month - 1, day, hour - 1, minute, second);
+    return { valid: true, iso: new Date(utcMs).toISOString() };
+  }
+
+  try {
+    const approxUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }).formatToParts(approxUtc);
+    const map: Record<string, number> = {};
+    for (const p of parts) {
+      if (p.type !== 'literal') map[p.type] = Number(p.value);
+    }
+    const tzAsUtc = Date.UTC(map.year, (map.month || 1) - 1, map.day || 1, (map.hour || 0) % 24, map.minute || 0, map.second || 0);
+    const offsetMs = tzAsUtc - approxUtc.getTime();
+    return { valid: true, iso: new Date(approxUtc.getTime() - offsetMs).toISOString() };
+  } catch {
+    const utcMs = Date.UTC(year, month - 1, day, hour - 1, minute, second);
+    return { valid: true, iso: new Date(utcMs).toISOString() };
+  }
+}
+
+async function calculateNextQueueSlotD1(db: D1Database): Promise<string> {
+  let dailyTimes = ['09:00', '14:00', '19:00'];
+  let timezone = 'Africa/Lagos';
+
+  try {
+    const cfg = await db.prepare('SELECT * FROM queue_settings WHERE id = ?').bind('singleton').first<any>();
+    if (cfg) {
+      timezone = cfg.timezone || 'Africa/Lagos';
+      const parsed = JSON.parse(cfg.daily_times_json || '["09:00","14:00","19:00"]');
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        dailyTimes = parsed.slice().sort();
+      }
+    }
+  } catch {}
+
+  const scheduledRes = await db.prepare(
+    `SELECT scheduled_at FROM jobs WHERE status IN ('scheduled', 'pending', 'processing') AND scheduled_at IS NOT NULL`
+  ).all<{ scheduled_at: string }>();
+  const occupied = new Set((scheduledRes.results || []).map(r => r.scheduled_at));
+
+  const now = new Date();
+  for (let dayOffset = 0; dayOffset < 30; dayOffset++) {
+    const candidateDay = new Date(now.getTime() + dayOffset * 86400000);
+    const datePart = candidateDay.toISOString().split('T')[0];
+    for (const t of dailyTimes) {
+      const normalized = normalizeScheduleToUtcIso(`${datePart}T${t}`, timezone);
+      if (normalized.valid && normalized.iso) {
+        if (new Date(normalized.iso).getTime() > now.getTime() + 5 * 60 * 1000 && !occupied.has(normalized.iso)) {
+          return normalized.iso;
+        }
+      }
+    }
+  }
+
+  return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
 }
 
 // -----------------------------------------------------------------------------
@@ -314,8 +657,7 @@ function decryptApiKey(encryptedData: string, ivHex: string, env: Env): string {
     let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
     return decrypted;
-  } catch (err: any) {
-    // Fallback rotation decryption attempt using historical key if changed
+  } catch {
     const legacyKey = crypto.createHash('sha256').update('salt-relay-master-encryption-key-victor-2026').digest();
     const legacyDecipher = crypto.createDecipheriv('aes-256-gcm', legacyKey, iv);
     legacyDecipher.setAuthTag(Buffer.from(authTagHex, 'hex'));
@@ -326,14 +668,14 @@ function decryptApiKey(encryptedData: string, ivHex: string, env: Env): string {
 }
 
 // -----------------------------------------------------------------------------
-// ZERNIO & SOCIAL DISPATCH HELPERS (Current Zernio API Specification)
+// ZERNIO & SOCIAL DISPATCH HELPERS
 // -----------------------------------------------------------------------------
 async function fetchZernioAccounts(apiKey: string): Promise<{ success: boolean; accounts: any[]; error?: string }> {
   try {
     const res = await fetch('https://zernio.com/api/v1/accounts', {
       headers: {
         'Authorization': `Bearer ${apiKey.trim()}`,
-        'User-Agent': 'SaltRelay-Publisher/1.0',
+        'User-Agent': 'SaltRelay-Publisher/2.1',
         'Accept': 'application/json'
       }
     });
@@ -369,7 +711,7 @@ async function publishToZernio(apiKey: string, payload: {
       headers: {
         'Authorization': `Bearer ${apiKey.trim()}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'SaltRelay-Publisher/1.0',
+        'User-Agent': 'SaltRelay-Publisher/2.1',
         'Accept': 'application/json'
       },
       body: JSON.stringify(payload)
@@ -382,24 +724,48 @@ async function publishToZernio(apiKey: string, payload: {
         external_post_url: json.url || json.postUrl || json.data?.url
       };
     }
-    return { success: false, error: json.message || json.error || `Zernio publish error ${res.status}` };
+    return { success: false, error: json.message || json.error || `Zernio publish error HTTP ${res.status}` };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
 }
 
 // -----------------------------------------------------------------------------
-// GITHUB ACTIONS ORCHESTRATION ENGINE
+// GITHUB ACTIONS ORCHESTRATION & RELEASE VERIFICATION ENGINE
 // -----------------------------------------------------------------------------
-async function dispatchMediaWorkflow(env: Env, jobId: string, rawLinks: string[]): Promise<{ success: boolean; error?: string }> {
+async function dispatchMediaWorkflow(
+  env: Env,
+  jobId: string,
+  sourceLinks: string[],
+  attemptNumber = 1
+): Promise<{ success: boolean; http_status?: number; run_id?: string | null; run_url?: string | null; error?: string }> {
+  const nowIso = new Date().toISOString();
+
   if (!env.GITHUB_PAT) {
-    return { success: false, error: 'GITHUB_PAT secret not configured in Worker' };
+    const errorMsg = 'Stage [dispatch]: GITHUB_PAT secret is not configured in Cloudflare Worker.';
+    await env.DB.prepare('UPDATE jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
+      .bind('failed', errorMsg, nowIso, jobId).run();
+    await env.DB.prepare(
+      `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ?
+       WHERE job_id = ? AND status IN ('pending', 'publishing')`
+    ).bind(errorMsg, nowIso, jobId).run();
+    await logJobEvent(env.DB, jobId, 'dispatch_failed', 'error', errorMsg, { attempt: attemptNumber });
+    return { success: false, error: errorMsg };
+  }
+
+  if (!Array.isArray(sourceLinks) || sourceLinks.length === 0) {
+    const errorMsg = 'Stage [dispatch] (field: links): Cannot dispatch workflow with 0 media source links.';
+    await env.DB.prepare('UPDATE jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
+      .bind('failed', errorMsg, nowIso, jobId).run();
+    await logJobEvent(env.DB, jobId, 'dispatch_failed', 'error', errorMsg, { attempt: attemptNumber });
+    return { success: false, error: errorMsg };
   }
 
   const owner = env.GITHUB_OWNER || 'motionssalt';
   const repo = env.GITHUB_REPO || 'salt-relay';
   const callbackUrl = 'https://salt-relay-api.motionssalt.workers.dev/api/callback/media-processed';
-  const callbackSecret = env.CALLBACK_SECRET || 'salt-relay-shared-secret';
+  const callbackSecret = env.CALLBACK_SECRET || '';
+  const dispatchStartedMs = Date.now();
 
   try {
     const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/process-media.yml/dispatches`, {
@@ -407,16 +773,17 @@ async function dispatchMediaWorkflow(env: Env, jobId: string, rawLinks: string[]
       headers: {
         'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
         'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'SaltRelay-Worker/2.0',
+        'User-Agent': 'SaltRelay-Worker/2.1',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         ref: 'main',
         inputs: {
           job_id: jobId,
-          media_json: JSON.stringify(rawLinks),
+          media_json: JSON.stringify(sourceLinks),
           callback_url: callbackUrl,
-          callback_secret: callbackSecret
+          callback_secret: callbackSecret,
+          attempt_number: String(attemptNumber)
         }
       })
     });
@@ -425,30 +792,41 @@ async function dispatchMediaWorkflow(env: Env, jobId: string, rawLinks: string[]
       let runId: string | null = null;
       let runUrl: string | null = null;
 
-      try {
-        // Brief pause to allow GitHub to register the dispatched workflow run
-        await new Promise(r => setTimeout(r, 1500));
-        const runsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/process-media.yml/runs?event=workflow_dispatch&per_page=5`, {
-          headers: {
-            'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
-            'Accept': 'application/vnd.github.v3+json',
-            'User-Agent': 'SaltRelay-Worker/2.0'
+      // Poll briefly to capture the newly created workflow run ID & URL accurately
+      const waitStepsMs = [250, 1200, 1800];
+      for (const waitMs of waitStepsMs) {
+        try {
+          await new Promise(r => setTimeout(r, waitMs));
+          const runsRes = await fetch(
+            `https://api.github.com/repos/${owner}/${repo}/actions/workflows/process-media.yml/runs?event=workflow_dispatch&per_page=5`,
+            {
+              headers: {
+                'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'SaltRelay-Worker/2.1'
+              }
+            }
+          );
+          if (runsRes.ok) {
+            const runsData = await runsRes.json() as any;
+            const runs = Array.isArray(runsData.workflow_runs) ? runsData.workflow_runs : [];
+            const matchingRun = runs.find((r: any) => {
+              if (!r || !r.id) return false;
+              const createdMs = r.created_at ? new Date(r.created_at).getTime() : dispatchStartedMs;
+              return createdMs >= dispatchStartedMs - 15000;
+            });
+            if (matchingRun) {
+              runId = String(matchingRun.id);
+              runUrl = matchingRun.html_url || `https://github.com/${owner}/${repo}/actions/runs/${runId}`;
+              await env.DB.prepare(
+                'UPDATE jobs SET workflow_run_id = ?, workflow_run_url = ?, updated_at = ? WHERE id = ?'
+              ).bind(runId, runUrl, new Date().toISOString(), jobId).run();
+              break;
+            }
           }
-        });
-        if (runsRes.ok) {
-          const runsData = await runsRes.json() as any;
-          const runs = runsData.workflow_runs || [];
-          const recentRun = runs[0];
-          if (recentRun && recentRun.id) {
-            runId = String(recentRun.id);
-            runUrl = recentRun.html_url;
-            await env.DB.prepare(
-              `UPDATE jobs SET workflow_run_id = ?, workflow_run_url = ? WHERE id = ?`
-            ).bind(runId, runUrl, jobId).run();
-          }
+        } catch (findErr: any) {
+          console.warn('Workflow run lookup attempt warning:', findErr.message);
         }
-      } catch (findErr: any) {
-        console.warn('Could not immediately identify workflow run ID:', findErr.message);
       }
 
       await logJobEvent(
@@ -456,20 +834,176 @@ async function dispatchMediaWorkflow(env: Env, jobId: string, rawLinks: string[]
         jobId,
         'dispatched',
         'info',
-        runUrl ? `GitHub Actions workflow dispatched. Run #${runId} active.` : 'GitHub Actions media processing workflow dispatched successfully.',
-        runId ? { run_id: runId, run_url: runUrl } : undefined
+        runUrl
+          ? `Attempt #${attemptNumber}: GitHub Actions workflow dispatched (HTTP ${res.status}). Run #${runId} active.`
+          : `Attempt #${attemptNumber}: GitHub Actions workflow dispatched (HTTP ${res.status}).`,
+        {
+          http_status: res.status,
+          attempt: attemptNumber,
+          source_count: sourceLinks.length,
+          run_id: runId,
+          run_url: runUrl
+        }
       );
-      return { success: true };
+
+      return { success: true, http_status: res.status, run_id: runId, run_url: runUrl };
     }
 
-    const text = await res.text();
-    const errorMsg = `GitHub dispatch returned HTTP ${res.status}: ${text}`;
-    await logJobEvent(env.DB, jobId, 'dispatch_failed', 'error', errorMsg);
-    return { success: false, error: errorMsg };
+    const rawErrText = scrubSecrets(await res.text(), env).slice(0, 500);
+    const errorMsg = `Stage [dispatch]: GitHub Actions workflow dispatch failed with HTTP ${res.status} — ${rawErrText || 'empty error response'}`;
+    const failTime = new Date().toISOString();
+
+    await env.DB.prepare('UPDATE jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
+      .bind('failed', errorMsg, failTime, jobId).run();
+    await env.DB.prepare(
+      `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ?
+       WHERE job_id = ? AND status IN ('pending', 'publishing')`
+    ).bind(errorMsg, failTime, jobId).run();
+    await logJobEvent(env.DB, jobId, 'dispatch_failed', 'error', errorMsg, {
+      http_status: res.status,
+      attempt: attemptNumber,
+      source_count: sourceLinks.length,
+      github_response: rawErrText
+    });
+
+    return { success: false, http_status: res.status, error: errorMsg };
   } catch (err: any) {
-    const errorMsg = `GitHub dispatch network error: ${err.message}`;
-    await logJobEvent(env.DB, jobId, 'dispatch_failed', 'error', errorMsg);
+    const cleanErr = scrubSecrets(err.message || String(err), env);
+    const errorMsg = `Stage [dispatch]: Network error calling GitHub Actions dispatch API — ${cleanErr}`;
+    const failTime = new Date().toISOString();
+
+    await env.DB.prepare('UPDATE jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
+      .bind('failed', errorMsg, failTime, jobId).run();
+    await env.DB.prepare(
+      `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ?
+       WHERE job_id = ? AND status IN ('pending', 'publishing')`
+    ).bind(errorMsg, failTime, jobId).run();
+    await logJobEvent(env.DB, jobId, 'dispatch_failed', 'error', errorMsg, {
+      attempt: attemptNumber,
+      source_count: sourceLinks.length
+    });
+
     return { success: false, error: errorMsg };
+  }
+}
+
+async function verifyExistingReleaseAssets(
+  env: Env,
+  jobId: string
+): Promise<{ reusable: boolean; count: number; reason: string }> {
+  if (!env.GITHUB_PAT) {
+    return { reusable: false, count: 0, reason: 'GITHUB_PAT unavailable for release verification' };
+  }
+
+  const mediaRes = await env.DB.prepare(
+    'SELECT * FROM job_media WHERE job_id = ? ORDER BY created_at ASC'
+  ).bind(jobId).all<any>();
+  const rows = mediaRes.results || [];
+
+  if (rows.length === 0) {
+    return { reusable: false, count: 0, reason: 'No processed media rows exist yet for this job' };
+  }
+
+  if (rows.some(r => r.status !== 'processed' || !r.release_tag || !r.asset_name || !r.file_size)) {
+    return { reusable: false, count: 0, reason: 'Existing media rows are incomplete or failed' };
+  }
+
+  const owner = env.GITHUB_OWNER || 'motionssalt';
+  const repo = env.GITHUB_REPO || 'salt-relay';
+  const releaseCache = new Map<string, any[]>();
+
+  for (const row of rows) {
+    const tag = String(row.release_tag);
+    if (!releaseCache.has(tag)) {
+      try {
+        const relRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(tag)}`, {
+          headers: {
+            'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'SaltRelay-Worker/2.1'
+          }
+        });
+        if (!relRes.ok) {
+          return { reusable: false, count: 0, reason: `Release tag '${tag}' lookup returned HTTP ${relRes.status}` };
+        }
+        const relData = await relRes.json() as any;
+        releaseCache.set(tag, Array.isArray(relData.assets) ? relData.assets : []);
+      } catch (err: any) {
+        return { reusable: false, count: 0, reason: `Release lookup error: ${err.message}` };
+      }
+    }
+
+    const assets = releaseCache.get(tag) || [];
+    const match = assets.find((a: any) =>
+      (row.asset_id && String(a.id) === String(row.asset_id)) || a.name === row.asset_name
+    );
+
+    if (!match) {
+      return { reusable: false, count: 0, reason: `Asset '${row.asset_name}' is no longer present on release '${tag}'` };
+    }
+
+    if (Number(match.size) !== Number(row.file_size)) {
+      return {
+        reusable: false,
+        count: 0,
+        reason: `Asset '${row.asset_name}' size mismatch (recorded ${row.file_size} vs release ${match.size})`
+      };
+    }
+
+    if (row.sha256 && typeof match.digest === 'string' && match.digest.startsWith('sha256:')) {
+      const remoteHex = match.digest.slice('sha256:'.length).toLowerCase();
+      if (remoteHex !== String(row.sha256).toLowerCase()) {
+        return {
+          reusable: false,
+          count: 0,
+          reason: `Asset '${row.asset_name}' SHA-256 hash mismatch on release '${tag}'`
+        };
+      }
+    }
+  }
+
+  return { reusable: true, count: rows.length, reason: 'All processed release assets verified present with matching size/hash' };
+}
+
+async function cleanupJobReleaseAssets(env: Env, jobId: string): Promise<void> {
+  if (!env.GITHUB_PAT) return;
+  const owner = env.GITHUB_OWNER || 'motionssalt';
+  const repo = env.GITHUB_REPO || 'salt-relay';
+
+  try {
+    const mediaRes = await env.DB.prepare(
+      `SELECT id, release_tag, asset_id, asset_name FROM job_media WHERE job_id = ? AND release_tag IS NOT NULL`
+    ).bind(jobId).all<any>();
+    const rows = mediaRes.results || [];
+    for (const row of rows) {
+      let targetAssetId = row.asset_id ? String(row.asset_id) : null;
+      if (!targetAssetId && row.release_tag && row.asset_name) {
+        const relRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(row.release_tag)}`, {
+          headers: {
+            'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'SaltRelay-Worker/2.1'
+          }
+        });
+        if (relRes.ok) {
+          const relData = await relRes.json() as any;
+          const found = (relData.assets || []).find((a: any) => a.name === row.asset_name);
+          if (found?.id) targetAssetId = String(found.id);
+        }
+      }
+      if (targetAssetId) {
+        await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/assets/${targetAssetId}`, {
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'SaltRelay-Worker/2.1'
+          }
+        });
+      }
+    }
+  } catch (err) {
+    console.warn(`[Cleanup] Non-fatal warning cleaning release assets for ${jobId}:`, err);
   }
 }
 
@@ -480,18 +1014,31 @@ async function executePublicationStep(env: Env, jobId: string): Promise<void> {
   const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first<any>();
   if (!job) return;
 
-  // Never publish or resurrect cancelled jobs
   if (job.status === 'cancelled') {
     console.log(`[Publication] Job ${jobId} was cancelled by operator. Aborting publication.`);
     return;
   }
 
   const now = new Date().toISOString();
-  await env.DB.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').bind('publishing', now, jobId).run();
-  await logJobEvent(env.DB, jobId, 'publishing', 'info', 'Commencing social platform publication via Zernio.');
-
   const mediaAssetsRes = await env.DB.prepare('SELECT * FROM job_media WHERE job_id = ? AND status = ?').bind(jobId, 'processed').all<any>();
   const mediaAssets = mediaAssetsRes.results || [];
+
+  // Guard: NEVER publish caption+hashtags without processed media!
+  if (mediaAssets.length === 0) {
+    const errMsg =
+      'Stage [publishing] (field: media): Cannot publish to social accounts because 0 processed media assets are available for this job. Use Retry to run media processing from the saved source links.';
+    await env.DB.prepare('UPDATE jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
+      .bind('failed', errMsg, now, jobId).run();
+    await env.DB.prepare(
+      `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ?
+       WHERE job_id = ? AND status IN ('pending', 'publishing')`
+    ).bind(errMsg, now, jobId).run();
+    await logJobEvent(env.DB, jobId, 'failed', 'error', errMsg);
+    return;
+  }
+
+  await env.DB.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').bind('publishing', now, jobId).run();
+  await logJobEvent(env.DB, jobId, 'publishing', 'info', `Commencing social platform publication via Zernio (${mediaAssets.length} processed media item(s)).`);
 
   const destinationsRes = await env.DB.prepare(
     `SELECT jd.*, a.platform_account_id, a.key_id
@@ -502,8 +1049,40 @@ async function executePublicationStep(env: Env, jobId: string): Promise<void> {
   const destinations = destinationsRes.results || [];
 
   if (destinations.length === 0) {
-    await env.DB.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').bind('published', now, jobId).run();
-    await logJobEvent(env.DB, jobId, 'published', 'info', 'All destinations were already processed.');
+    await env.DB.prepare('UPDATE jobs SET status = ?, error_message = NULL, updated_at = ? WHERE id = ?').bind('published', now, jobId).run();
+    await logJobEvent(env.DB, jobId, 'published', 'info', 'All target destinations were already published or skipped.');
+    return;
+  }
+
+  const mediaItems: Array<{ url: string; type: 'video' | 'image' }> = mediaAssets.map(m => {
+    let url = m.asset_download_url || m.source_url;
+    if (m.asset_name && url && url.includes('github.com')) {
+      url = `https://salt-relay-api.motionssalt.workers.dev/api/public/media/${jobId}/${encodeURIComponent(m.asset_name)}`;
+    }
+    return {
+      url,
+      type: m.file_type === 'video' ? 'video' : 'image'
+    };
+  });
+
+  // Safe Dry-Run Verification Mode: verifies pipeline end-to-end right up to Zernio without live social posting
+  if (Number(job.dry_run) === 1) {
+    const finishIso = new Date().toISOString();
+    await env.DB.prepare(
+      `UPDATE job_destinations SET status = 'skipped', error_message = 'Dry-run verification: skipped live Zernio publish call', updated_at = ?
+       WHERE job_id = ? AND status IN ('pending', 'publishing', 'failed')`
+    ).bind(finishIso, jobId).run();
+    await env.DB.prepare(
+      `UPDATE jobs SET status = 'published', error_message = NULL, published_at = ?, updated_at = ? WHERE id = ?`
+    ).bind(finishIso, finishIso, jobId).run();
+    await logJobEvent(
+      env.DB,
+      jobId,
+      'dry_run_verified',
+      'info',
+      `Dry-run pipeline verification complete: ${mediaItems.length} processed media URL(s) verified ready for ${destinations.length} destination(s). Live Zernio publish skipped.`,
+      { media_items: mediaItems, destinations_checked: destinations.length }
+    );
     return;
   }
 
@@ -517,62 +1096,69 @@ async function executePublicationStep(env: Env, jobId: string): Promise<void> {
   }));
 
   const fullContent = [job.caption, job.hashtags].filter(Boolean).join('\n\n').trim();
-
-  // Prepare media items for Zernio
-  const mediaItems: Array<{ url: string; type: 'video' | 'image' }> = mediaAssets.map(m => {
-    let url = m.asset_download_url || m.source_url;
-    // If it's a GitHub release asset from private repo, route through Worker's public media proxy
-    if (m.asset_name && url.includes('github.com')) {
-      url = `https://salt-relay-api.motionssalt.workers.dev/api/public/media/${jobId}/${encodeURIComponent(m.asset_name)}`;
-    }
-    return {
-      url,
-      type: m.file_type === 'video' ? 'video' : 'image'
-    };
-  });
-
-  let successCount = 0;
-  let failCount = 0;
-  let skippedCount = 0;
+  const platformsCaps = (capabilitiesConfig as any).platforms || {};
 
   for (const dest of destinations) {
-    const apiKey = keyMap.get(dest.key_id);
+    const cap = platformsCaps[dest.platform];
     const attemptTime = new Date().toISOString();
 
+    if (dest.post_type === 'story' && cap && cap.story_support === false) {
+      await env.DB.prepare(
+        `UPDATE job_destinations SET status = 'skipped', error_message = ?, updated_at = ? WHERE id = ?`
+      ).bind(`Platform ${dest.platform} does not support Story publishing`, attemptTime, dest.id).run();
+      continue;
+    }
+
+    // Filter media items compatible with this platform if specified
+    const supportedTypes: string[] | undefined = cap?.supported_media;
+    const eligibleMedia = Array.isArray(supportedTypes) && supportedTypes.length > 0
+      ? mediaItems.filter(mi => supportedTypes.includes(mi.type))
+      : mediaItems;
+
+    if (eligibleMedia.length === 0) {
+      const skipMsg = `Skipped ${dest.platform} (${dest.post_type}): platform supports [${(supportedTypes || []).join(', ')}] only, no matching media in job.`;
+      await env.DB.prepare(
+        `UPDATE job_destinations SET status = 'skipped', error_message = ?, updated_at = ? WHERE id = ?`
+      ).bind(skipMsg, attemptTime, dest.id).run();
+      await logJobEvent(env.DB, jobId, 'dest_skipped', 'warn', skipMsg);
+      continue;
+    }
+
+    const apiKey = keyMap.get(dest.key_id);
     if (!apiKey) {
-      failCount++;
-      const errMsg = 'Active decrypted Zernio API key not found';
+      const errMsg = `Stage [publishing] (${dest.platform} ${dest.post_type}): Active decrypted Zernio API key not found`;
       await env.DB.prepare(
         `UPDATE job_destinations SET status = 'failed', error_message = ?, attempts = attempts + 1, last_attempt_at = ?, updated_at = ?
          WHERE id = ?`
       ).bind(errMsg, attemptTime, attemptTime, dest.id).run();
-      await logJobEvent(env.DB, jobId, 'dest_failed', 'error', `Destination ${dest.platform} (${dest.post_type}) failed: ${errMsg}`);
+      await logJobEvent(env.DB, jobId, 'dest_failed', 'error', errMsg);
       continue;
     }
 
     try {
       const zPayload: any = {
-        content: fullContent,
+        content: cap?.caption_limit ? fullContent.slice(0, cap.caption_limit) : fullContent,
+        mediaItems: eligibleMedia,
         platforms: [{ platform: dest.platform, accountId: dest.platform_account_id }],
         publishNow: true,
         story: dest.post_type === 'story'
       };
 
-      if (mediaItems.length > 0) {
-        zPayload.mediaItems = mediaItems;
-      }
-
       const pubRes = await publishToZernio(apiKey, zPayload);
 
       if (pubRes.success) {
-        successCount++;
         await env.DB.prepare(
           `UPDATE job_destinations SET status = 'published', external_post_id = ?, external_post_url = ?, error_message = NULL, attempts = attempts + 1, last_attempt_at = ?, updated_at = ?
            WHERE id = ?`
         ).bind(pubRes.external_post_id || null, pubRes.external_post_url || null, attemptTime, attemptTime, dest.id).run();
-        await logJobEvent(env.DB, jobId, 'dest_published', 'info', `Successfully published to ${dest.platform} (${dest.post_type}). External ID: ${pubRes.external_post_id || 'ok'}`);
+        await logJobEvent(
+          env.DB,
+          jobId,
+          'dest_published',
+          'info',
+          `Successfully published to ${dest.platform} (${dest.post_type}). External ID: ${pubRes.external_post_id || 'ok'}`
+        );
       } else {
-        failCount++;
         const errMsg = pubRes.error || 'Zernio publishing error';
         await env.DB.prepare(
           `UPDATE job_destinations SET status = 'failed', error_message = ?, attempts = attempts + 1, last_attempt_at = ?, updated_at = ?
@@ -581,34 +1167,45 @@ async function executePublicationStep(env: Env, jobId: string): Promise<void> {
         await logJobEvent(env.DB, jobId, 'dest_failed', 'error', `Failed to publish to ${dest.platform} (${dest.post_type}): ${errMsg}`);
       }
     } catch (publishErr: any) {
-      failCount++;
-      const errMsg = publishErr.message || 'Network error during publish';
+      const errMsg = publishErr.message || 'Network error during Zernio publish';
       await env.DB.prepare(
         `UPDATE job_destinations SET status = 'failed', error_message = ?, attempts = attempts + 1, last_attempt_at = ?, updated_at = ?
          WHERE id = ?`
       ).bind(errMsg, attemptTime, attemptTime, dest.id).run();
-      await logJobEvent(env.DB, jobId, 'dest_failed', 'error', `Exception publishing to ${dest.platform}: ${errMsg}`);
+      await logJobEvent(env.DB, jobId, 'dest_failed', 'error', `Exception publishing to ${dest.platform} (${dest.post_type}): ${errMsg}`);
     }
   }
 
-  // Determine overall job status
+  // Recompute aggregate status across ALL destinations of this job so earlier published destinations are never forgotten
+  const allDestsRes = await env.DB.prepare(
+    'SELECT platform, post_type, status, error_message FROM job_destinations WHERE job_id = ?'
+  ).bind(jobId).all<any>();
+  const allDests = allDestsRes.results || [];
+
+  const publishedCount = allDests.filter(d => d.status === 'published').length;
+  const failedDests = allDests.filter(d => d.status === 'failed');
+  const failedCount = failedDests.length;
+  const skippedCount = allDests.filter(d => d.status === 'skipped').length;
+
   let finalStatus = 'published';
   let summaryError: string | null = null;
 
-  if (successCount === 0 && failCount > 0) {
+  if (publishedCount === 0 && failedCount > 0) {
     finalStatus = 'failed';
-    summaryError = `Publication failed across all ${failCount} destination(s).`;
-  } else if (successCount > 0 && failCount > 0) {
+    const firstReason = failedDests[0]?.error_message || 'Unknown error';
+    summaryError = `Stage [publishing]: Publication failed across all ${failedCount} destination(s) — ${firstReason}`;
+  } else if (publishedCount > 0 && failedCount > 0) {
     finalStatus = 'partially_published';
-    summaryError = `Partial success: ${successCount} published, ${failCount} failed.`;
-  } else if (successCount === 0 && failCount === 0) {
+    const firstReason = failedDests[0]?.error_message || 'Unknown error';
+    summaryError = `Partial success (${publishedCount} published, ${failedCount} failed): ${firstReason}`;
+  } else if (publishedCount === 0 && failedCount === 0) {
     finalStatus = skippedCount > 0 ? 'published' : 'failed';
-    if (finalStatus === 'failed') summaryError = 'No destinations were dispatched.';
+    if (finalStatus === 'failed') summaryError = 'Stage [publishing]: No active destinations were configured for this job.';
   }
 
   const finishedTime = new Date().toISOString();
   await env.DB.prepare(
-    `UPDATE jobs SET status = ?, error_message = ?, published_at = ?, updated_at = ? WHERE id = ?`
+    `UPDATE jobs SET status = ?, error_message = ?, published_at = COALESCE(published_at, ?), updated_at = ? WHERE id = ?`
   ).bind(finalStatus, summaryError, finalStatus === 'published' ? finishedTime : null, finishedTime, jobId).run();
 
   await logJobEvent(
@@ -616,8 +1213,13 @@ async function executePublicationStep(env: Env, jobId: string): Promise<void> {
     jobId,
     finalStatus,
     finalStatus === 'failed' ? 'error' : 'info',
-    `Publication cycle concluded with status: ${finalStatus}. Successes: ${successCount}, Failures: ${failCount}, Skipped: ${skippedCount}`
+    `Publication cycle concluded with status: ${finalStatus}. Published: ${publishedCount}, Failed: ${failedCount}, Skipped: ${skippedCount}`
   );
+
+  // Delete temporary GitHub Release assets ONLY after all dependent destinations have completed (0 failed/pending)
+  if (finalStatus === 'published' && failedCount === 0) {
+    await cleanupJobReleaseAssets(env, jobId);
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -663,39 +1265,41 @@ export default {
         return jsonResponse({ error: 'Media asset not found' }, 404, {}, request);
       }
 
-      // If direct media url that is publicly available, redirect
       if (media.source_type === 'direct' && media.asset_download_url && !media.asset_download_url.includes('github.com')) {
         return Response.redirect(media.asset_download_url, 302);
       }
 
-      // If GitHub release asset: fetch using Worker's GITHUB_PAT
       if (env.GITHUB_PAT) {
         const owner = env.GITHUB_OWNER || 'motionssalt';
         const repo = env.GITHUB_REPO || 'salt-relay';
         const tag = media.release_tag || 'media-001';
 
         try {
-          const relRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/tags/${tag}`, {
-            headers: {
-              'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
-              'Accept': 'application/vnd.github.v3+json',
-              'User-Agent': 'SaltRelay-Worker/1.0'
-            }
-          });
-          const relData = await relRes.json().catch(() => ({})) as any;
-          const targetAsset = (relData.assets || []).find((a: any) => a.name === assetName);
+          let targetAssetId = media.asset_id ? String(media.asset_id) : null;
 
-          if (targetAsset && targetAsset.id) {
-            const assetRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/assets/${targetAsset.id}`, {
+          if (!targetAssetId) {
+            const relRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/tags/${tag}`, {
+              headers: {
+                'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'SaltRelay-Worker/2.1'
+              }
+            });
+            const relData = await relRes.json().catch(() => ({})) as any;
+            const targetAsset = (relData.assets || []).find((a: any) => a.name === assetName);
+            if (targetAsset?.id) targetAssetId = String(targetAsset.id);
+          }
+
+          if (targetAssetId) {
+            const assetRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/assets/${targetAssetId}`, {
               headers: {
                 'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
                 'Accept': 'application/octet-stream',
-                'User-Agent': 'SaltRelay-Worker/2.0'
+                'User-Agent': 'SaltRelay-Worker/2.1'
               },
               redirect: 'manual'
             });
 
-            // If GitHub redirected to signed CDN (AWS S3 / Azure blob), forward client directly
             if (assetRes.status >= 300 && assetRes.status < 400) {
               const redirectLocation = assetRes.headers.get('Location');
               if (redirectLocation) {
@@ -704,7 +1308,7 @@ export default {
             }
 
             const contentType = media.file_type === 'video' ? 'video/mp4' : 'image/jpeg';
-            return new Response(assetRes.body, {
+            return new Response(request.method === 'HEAD' ? null : assetRes.body, {
               status: assetRes.status,
               headers: {
                 'Content-Type': contentType,
@@ -718,7 +1322,7 @@ export default {
         }
       }
 
-      if (media.asset_download_url) {
+      if (media.asset_download_url && !media.asset_download_url.includes('github.com')) {
         return Response.redirect(media.asset_download_url, 302);
       }
       return jsonResponse({ error: 'Asset download unavailable' }, 404, {}, request);
@@ -798,7 +1402,7 @@ export default {
       const jobId = body.job_id;
       if (!jobId) return jsonResponse({ error: 'job_id required' }, 400, {}, request);
 
-      const job = await env.DB.prepare('SELECT id, status, error_message FROM jobs WHERE id = ?').bind(jobId).first<any>();
+      const job = await env.DB.prepare('SELECT id, status, error_message, attempt_count FROM jobs WHERE id = ?').bind(jobId).first<any>();
       if (!job) {
         return jsonResponse({ error: 'Job not found' }, 404, {}, request);
       }
@@ -813,26 +1417,24 @@ export default {
       const now = new Date().toISOString();
 
       // 2. Accept late signed callbacks for jobs previously failed by watchdog (F1)
-      const isLateCallback = job.status === 'failed';
-      if (isLateCallback) {
-        console.log(`[Callback] Valid signed late callback arrived for watchdog-failed job ${jobId}. Resuming publication.`);
+      if (job.status === 'failed') {
+        console.log(`[Callback] Valid signed late callback arrived for failed job ${jobId}. Resuming publication.`);
         await logJobEvent(
           env.DB,
           jobId,
           'late_callback_accepted',
           'info',
-          `Late signed callback accepted. Resuming job that was previously timed out by watchdog.`
+          'Late signed callback accepted. Resuming unfulfilled destinations.'
         );
-        // Reset destination statuses to pending
         await env.DB.prepare(
           `UPDATE job_destinations SET status = 'pending', error_message = NULL, updated_at = ?
-           WHERE job_id = ? AND status = 'failed' AND (error_message LIKE '%timeout%' OR error_message IS NULL)`
+           WHERE job_id = ? AND status = 'failed'`
         ).bind(now, jobId).run();
       }
 
       // 3. Handle pipeline failure reported from GitHub Actions runner
-      if (body.status === 'failed' || (body.failed_count > 0 && body.processed_count === 0)) {
-        const failureReason = body.error || `Media pipeline processing error in stage ${body.stage || 'pipeline'}`;
+      if (body.status === 'failed' || (body.failed_count > 0 && body.processed_count === 0) || (Array.isArray(body.media) && body.media.filter((m: any) => m.status === 'processed').length === 0 && body.status !== 'success')) {
+        const failureReason = body.error || `Stage [${body.stage || 'media_processing'}]: Media processing failed in GitHub Actions.`;
         await env.DB.prepare(
           `UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`
         ).bind(failureReason, now, jobId).run();
@@ -843,20 +1445,22 @@ export default {
         ).bind(failureReason, now, jobId).run();
 
         await logJobEvent(env.DB, jobId, 'transcode_failed', 'error', failureReason, {
-          stage: body.stage || 'pipeline',
+          stage: body.stage || 'media_processing',
+          attempt: body.attempt || job.attempt_count || 1,
           error: failureReason
         });
 
         return jsonResponse({ success: true, message: 'Pipeline failure recorded' }, 200, {}, request);
       }
 
-      // 4. Record processed media assets
-      const mediaList = body.media || [];
+      // 4. Replace processed media rows for this job cleanly (never mutating immutable job_sources!)
+      const mediaList = Array.isArray(body.media) ? body.media : [];
+      await env.DB.prepare('DELETE FROM job_media WHERE job_id = ?').bind(jobId).run();
 
       for (const m of mediaList) {
         await env.DB.prepare(
-          `INSERT INTO job_media (id, job_id, source_url, source_type, file_type, filename, mime_type, file_size, width, height, duration_sec, release_tag, asset_name, asset_download_url, status, error, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO job_media (id, job_id, source_url, source_type, file_type, filename, mime_type, file_size, width, height, duration_sec, release_tag, asset_id, asset_name, asset_download_url, sha256, status, error, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           `m_${crypto.randomUUID().slice(0, 8)}`,
           jobId,
@@ -869,9 +1473,11 @@ export default {
           m.width || null,
           m.height || null,
           m.duration_sec || null,
-          body.release_tag || null,
-          m.asset_name || null,
+          body.release_tag || m.release_tag || null,
+          m.asset_id ? String(m.asset_id) : null,
+          m.asset_name || m.filename || null,
           m.asset_download_url || null,
+          m.sha256 || null,
           m.status || 'processed',
           m.error || null,
           now
@@ -883,11 +1489,10 @@ export default {
         jobId,
         'transcoded',
         'info',
-        `GitHub Actions processing completed. ${body.processed_count || mediaList.length} media asset(s) ready.`,
-        { release_tag: body.release_tag }
+        `GitHub Actions processing completed. ${body.processed_count || mediaList.filter((m: any) => m.status === 'processed').length} media asset(s) verified on release ${body.release_tag || 'media-001'}.`,
+        { release_tag: body.release_tag, attempt: body.attempt || job.attempt_count || 1 }
       );
 
-      // Trigger immediate publication for this job
       ctx.waitUntil(executePublicationStep(env, jobId));
 
       return jsonResponse({ success: true, message: 'Media recorded, publication initiated' }, 200, {}, request);
@@ -913,11 +1518,14 @@ export default {
         const jobId = path.replace('/api/public/dispatch-job/', '');
         const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first<any>();
         if (!job) return jsonResponse({ error: 'Job not found' }, 404, {}, request);
-        let links: string[] = [];
-        try { links = JSON.parse(job.raw_links_json || '[]'); } catch {}
-        await env.DB.prepare('UPDATE jobs SET status = "processing", updated_at = ? WHERE id = ?').bind(new Date().toISOString(), jobId).run();
-        const dispatchRes = await dispatchMediaWorkflow(env, jobId, links);
-        return jsonResponse({ success: dispatchRes.success, error: dispatchRes.error }, dispatchRes.success ? 200 : 500, {}, request);
+        const { sources } = await resolveOrRecoverJobSources(env.DB, job);
+        if (sources.length === 0) {
+          return jsonResponse({ error: LEGACY_NO_SOURCES_MESSAGE }, 400, {}, request);
+        }
+        await env.DB.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?')
+          .bind('processing', new Date().toISOString(), jobId).run();
+        const dispatchRes = await dispatchMediaWorkflow(env, jobId, sources.map(s => s.source_url), Number(job.attempt_count) || 1);
+        return jsonResponse(dispatchRes, dispatchRes.success ? 200 : 502, {}, request);
       }
       return jsonResponse({ error: 'Unauthorized' }, 401, {}, request);
     }
@@ -983,7 +1591,10 @@ export default {
     // ACCOUNTS
     // -------------------------------------------------------------------------
     if (path === '/api/accounts' && request.method === 'GET') {
-      const { results = [] } = await env.DB.prepare('SELECT * FROM accounts ORDER BY platform ASC, name ASC').all();
+      const { results = [] } = await env.DB.prepare(
+        'SELECT * FROM accounts ORDER BY platform ASC, name ASC'
+      ).all();
+
       const keysRes = await env.DB.prepare('SELECT id, label FROM api_keys').all<{ id: string; label: string }>();
       const keyMap = new Map((keysRes.results || []).map(k => [k.id, k.label]));
 
@@ -1052,74 +1663,113 @@ export default {
     }
 
     // -------------------------------------------------------------------------
-    // DRIVE & LINK INSPECTION (Supports folders & single file links)
+    // DRIVE & LINK INSPECTION (Supports folders & single file links with real checks)
     // -------------------------------------------------------------------------
     if (path === '/api/drive/inspect' && request.method === 'POST') {
       const body = await request.json().catch(() => ({})) as any;
       const targetUrl = (body.url || '').trim();
-      if (!targetUrl) return jsonResponse({ error: 'URL required' }, 400, {}, request);
+      if (!targetUrl) return jsonResponse({ error: 'Field [url]: Media source URL is required for inspection.' }, 400, {}, request);
 
-      // Public Google Drive Folder
-      if (targetUrl.includes('drive.google.com/drive/folders/')) {
-        const match = targetUrl.match(/folders\/([a-zA-Z0-9_-]+)/);
+      const check = classifySourceUrl(targetUrl);
+      if (!check.valid || !check.kind) {
+        return jsonResponse({ success: false, files: [], error: check.reason }, 400, {}, request);
+      }
+
+      if (check.kind === 'drive_folder') {
+        const match = targetUrl.match(/\/folders\/([a-zA-Z0-9_-]+)/);
         const folderId = match ? match[1] : null;
         try {
-          const resp = await fetch(`https://drive.google.com/drive/folders/${folderId}`, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+          const embedResp = await fetch(`https://drive.google.com/embeddedfolderview?id=${folderId}#list`, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' }
           });
-          const html = await resp.text();
+          const embedHtml = await embedResp.text();
+          if (embedHtml.includes('accounts.google.com/ServiceLogin')) {
+            return jsonResponse({
+              success: false,
+              files: [],
+              error: `Google Drive folder '${targetUrl}' is private. Set sharing to 'Anyone with the link'.`
+            }, 200, {}, request);
+          }
+
           const fileIds = new Set<string>();
-          const simpleRegex = /([a-zA-Z0-9_-]{28,33})/g;
+          const entryRegex = /(?:\/file\/d\/|id="entry-)([a-zA-Z0-9_-]{20,})/g;
           let m;
-          while ((m = simpleRegex.exec(html)) !== null) {
-            const candidate = m[1];
-            if (candidate !== folderId && !candidate.startsWith('drive') && !candidate.includes('google')) {
-              fileIds.add(candidate);
+          while ((m = entryRegex.exec(embedHtml)) !== null) {
+            if (m[1] !== folderId) fileIds.add(m[1]);
+          }
+
+          if (fileIds.size === 0) {
+            const resp = await fetch(`https://drive.google.com/drive/folders/${folderId}`, {
+              headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+            });
+            const html = await resp.text();
+            const fallbackRegex = /(?:\/file\/d\/|[?&]id=)([a-zA-Z0-9_-]{25,45})/g;
+            while ((m = fallbackRegex.exec(html)) !== null) {
+              if (m[1] !== folderId && !m[1].includes('google')) fileIds.add(m[1]);
             }
           }
+
           const files = Array.from(fileIds).slice(0, 50).map((id, idx) => ({
-            url: `https://drive.google.com/uc?export=download&id=${id}&confirm=t`,
+            url: `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`,
             source_type: 'drive',
             name: `drive_asset_${idx + 1}`,
-            file_type: 'unknown',
+            file_type: 'video',
             accessible: true
           }));
           return jsonResponse({ success: true, files }, 200, {}, request);
         } catch (err: any) {
           return jsonResponse({ success: false, files: [], error: err.message }, 200, {}, request);
         }
-      } else if (targetUrl.includes('drive.google.com/file/d/')) {
-        // Public Google Drive single file link
-        const match = targetUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+      } else if (check.kind === 'drive_file') {
+        const match = targetUrl.match(/(?:\/file\/d\/|[?&]id=)([a-zA-Z0-9_-]+)/);
         const fileId = match ? match[1] : null;
+        const dlUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+        let accessible = true;
+        let fileType = 'video';
+        try {
+          const headRes = await fetch(dlUrl, { method: 'HEAD' });
+          const ct = (headRes.headers.get('content-type') || '').toLowerCase();
+          if (headRes.status === 404 || headRes.status === 401 || headRes.status === 403) accessible = false;
+          if (ct.startsWith('image/')) fileType = 'image';
+        } catch {}
         return jsonResponse({
-          success: true,
-          files: [{
-            url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
+          success: accessible,
+          files: accessible ? [{
+            url: dlUrl,
             source_type: 'drive',
             name: `drive_file_${fileId || 'asset'}`,
-            file_type: 'unknown',
-            accessible: true
-          }]
+            file_type: fileType,
+            accessible
+          }] : [],
+          error: accessible ? undefined : `Google Drive file '${targetUrl}' is not publicly accessible.`
         }, 200, {}, request);
       } else {
-        // Direct media URL
-        const isVideo = /\.(mp4|mov|webm)$/i.test(targetUrl);
+        const isVideo = /\.(mp4|mov|webm|m4v)$/i.test(targetUrl.split('?')[0]);
+        let accessible = true;
+        let detectedType = isVideo ? 'video' : 'image';
+        try {
+          const headRes = await fetch(targetUrl, { method: 'HEAD' });
+          if (headRes.status === 404 || headRes.status === 401 || headRes.status === 403) accessible = false;
+          const ct = (headRes.headers.get('content-type') || '').toLowerCase();
+          if (ct.startsWith('video/')) detectedType = 'video';
+          else if (ct.startsWith('image/')) detectedType = 'image';
+        } catch {}
         return jsonResponse({
-          success: true,
-          files: [{
+          success: accessible,
+          files: accessible ? [{
             url: targetUrl,
             source_type: 'direct',
             name: targetUrl.split('?')[0].split('/').pop() || 'media_asset',
-            file_type: isVideo ? 'video' : 'image',
-            accessible: true
-          }]
+            file_type: detectedType,
+            accessible
+          }] : [],
+          error: accessible ? undefined : `Direct URL '${targetUrl}' returned inaccessible HTTP status.`
         }, 200, {}, request);
       }
     }
 
     // -------------------------------------------------------------------------
-    // JOBS
+    // JOBS LIST & DETAILS
     // -------------------------------------------------------------------------
     if (path === '/api/jobs' && request.method === 'GET') {
       const status = url.searchParams.get('status');
@@ -1140,9 +1790,10 @@ export default {
 
     if (path.startsWith('/api/jobs/') && request.method === 'GET' && !path.endsWith('/retry') && !path.endsWith('/cancel')) {
       const jobId = path.replace('/api/jobs/', '');
-      const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first();
+      const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first<any>();
       if (!job) return jsonResponse({ error: 'Job not found' }, 404, {}, request);
 
+      const { sources } = await resolveOrRecoverJobSources(env.DB, job);
       const mediaRes = await env.DB.prepare('SELECT * FROM job_media WHERE job_id = ? ORDER BY created_at ASC').bind(jobId).all();
       const destRes = await env.DB.prepare('SELECT * FROM job_destinations WHERE job_id = ? ORDER BY platform ASC').bind(jobId).all();
       const logsRes = await env.DB.prepare('SELECT * FROM execution_logs WHERE job_id = ? ORDER BY created_at ASC').bind(jobId).all();
@@ -1154,7 +1805,12 @@ export default {
       } catch {}
 
       return jsonResponse({
-        job,
+        job: {
+          ...job,
+          attempt_count: Number(job.attempt_count) || 1,
+          sources_json: job.sources_json || JSON.stringify(sources.map(s => s.source_url))
+        },
+        sources,
         media: mediaRes.results || [],
         destinations: destRes.results || [],
         logs: logsRes.results || [],
@@ -1162,53 +1818,122 @@ export default {
       }, 200, {}, request);
     }
 
-    // CREATE POST
+    // -------------------------------------------------------------------------
+    // CREATE POST (F5: Strict source validation, immutable storage, immediate/accurate dispatch)
+    // -------------------------------------------------------------------------
     if (path === '/api/jobs' && request.method === 'POST') {
       const body = await request.json().catch(() => ({})) as any;
       const {
         caption = '',
         hashtags = '',
-        links = [],
         publish_mode = 'now',
         scheduled_at,
+        timezone = 'Africa/Lagos',
         story_enabled = false,
-        selected_destinations = []
+        selected_destinations = [],
+        dry_run = false
       } = body;
 
-      const cleanLinks = Array.isArray(links) ? links.filter((l: string) => typeof l === 'string' && l.trim().length > 0) : [];
+      const submittedLinks = body.links ?? body.sources ?? body.media_links ?? [];
+      const sourceValidation = validateSubmittedSources(submittedLinks);
 
-      if (!caption.trim() && cleanLinks.length === 0) {
-        return jsonResponse({ error: 'Caption or media links are required' }, 400, {}, request);
+      if (!sourceValidation.valid) {
+        return jsonResponse({
+          error: sourceValidation.error,
+          stage: sourceValidation.stage || 'create_validation',
+          field: sourceValidation.field || 'links'
+        }, 400, {}, request);
+      }
+
+      if (!['now', 'queue', 'schedule'].includes(publish_mode)) {
+        return jsonResponse({
+          error: `Validation failed [stage: create_validation, field: publish_mode]: Unsupported publish_mode '${publish_mode}'.`,
+          stage: 'create_validation',
+          field: 'publish_mode'
+        }, 400, {}, request);
+      }
+
+      let finalSchedule: string | null = null;
+      let shouldDispatchImmediately = publish_mode === 'now';
+
+      if (publish_mode === 'schedule') {
+        const norm = normalizeScheduleToUtcIso(scheduled_at, timezone);
+        if (!norm.valid || !norm.iso) {
+          return jsonResponse({
+            error: `Validation failed [stage: create_validation, field: scheduled_at]: ${norm.error || 'A valid scheduled_at date/time is required when publish_mode is schedule.'}`,
+            stage: 'create_validation',
+            field: 'scheduled_at'
+          }, 400, {}, request);
+        }
+        finalSchedule = norm.iso;
+        // If scheduled time is already due (or within 30s), dispatch immediately instead of stalling!
+        if (new Date(finalSchedule).getTime() <= Date.now() + 30 * 1000) {
+          shouldDispatchImmediately = true;
+        }
+      } else if (publish_mode === 'queue') {
+        finalSchedule = await calculateNextQueueSlotD1(env.DB);
+      }
+
+      const accRes = await env.DB.prepare('SELECT * FROM accounts WHERE is_active = 1').all<any>();
+      const allAccs = accRes.results || [];
+      const targets = Array.isArray(selected_destinations) && selected_destinations.length > 0
+        ? allAccs.filter((a: any) => selected_destinations.includes(a.id))
+        : allAccs;
+
+      if (targets.length === 0) {
+        return jsonResponse({
+          error: 'Validation failed [stage: create_validation, field: selected_destinations]: At least one connected active social destination account is required.',
+          stage: 'create_validation',
+          field: 'selected_destinations'
+        }, 400, {}, request);
       }
 
       const jobId = `job_${crypto.randomUUID().slice(0, 10)}`;
       const now = new Date().toISOString();
-
-      let finalSchedule = scheduled_at || null;
-      let initialStatus = 'pending';
-
-      if (publish_mode === 'queue' || publish_mode === 'schedule') {
-        initialStatus = 'scheduled';
-        if (publish_mode === 'queue' && !finalSchedule) {
-          const d = new Date(Date.now() + 60 * 60 * 1000); // Default next slot +1 hour
-          finalSchedule = d.toISOString();
-        }
-      }
+      const cleanLinks = sourceValidation.sources.map(s => s.source_url);
+      const sourcesJsonStr = JSON.stringify(cleanLinks);
+      const initialStatus = shouldDispatchImmediately ? 'processing' : 'scheduled';
+      const isDryRun = dry_run === true || dry_run === 1 ? 1 : 0;
 
       await env.DB.prepare(
-        `INSERT INTO jobs (id, caption, hashtags, raw_links_json, publish_mode, status, story_enabled, scheduled_at, timezone, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Africa/Lagos', ?, ?)`
-      ).bind(jobId, caption.trim(), hashtags.trim(), JSON.stringify(cleanLinks), publish_mode, initialStatus, story_enabled ? 1 : 0, finalSchedule, now, now).run();
+        `INSERT INTO jobs (id, caption, hashtags, raw_links_json, sources_json, publish_mode, status, story_enabled, scheduled_at, timezone, attempt_count, dry_run, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+      ).bind(
+        jobId,
+        String(caption || '').trim(),
+        String(hashtags || '').trim(),
+        sourcesJsonStr,
+        sourcesJsonStr,
+        publish_mode,
+        initialStatus,
+        story_enabled ? 1 : 0,
+        finalSchedule,
+        timezone,
+        isDryRun,
+        now,
+        now
+      ).run();
 
-      await logJobEvent(env.DB, jobId, 'created', 'info', `Job created with publish_mode: ${publish_mode}`);
+      // Persist immutable normalized rows in job_sources
+      await saveImmutableJobSources(env.DB, jobId, sourceValidation.sources, now);
 
-      // Insert Destinations
-      const accRes = await env.DB.prepare('SELECT * FROM accounts WHERE is_active = 1').all<any>();
-      const allAccs = accRes.results || [];
-      const targets = selected_destinations.length > 0
-        ? allAccs.filter((a: any) => selected_destinations.includes(a.id))
-        : allAccs;
+      await logJobEvent(
+        env.DB,
+        jobId,
+        'created',
+        'info',
+        `Job created with publish_mode: ${publish_mode} and ${cleanLinks.length} immutable media source link(s)${isDryRun ? ' [DRY RUN]' : ''}.`,
+        {
+          publish_mode,
+          scheduled_at: finalSchedule,
+          source_count: cleanLinks.length,
+          sources: sourceValidation.sources,
+          dry_run: Boolean(isDryRun)
+        }
+      );
 
+      // Insert destination rows (respecting story_support capability)
+      const platformsCaps = (capabilitiesConfig as any).platforms || {};
       for (const acc of targets) {
         const idempotency = crypto.createHash('sha256').update(`${jobId}:${acc.id}:feed`).digest('hex').slice(0, 32);
         await env.DB.prepare(
@@ -1217,70 +1942,84 @@ export default {
         ).bind(`dest_${crypto.randomUUID().slice(0, 8)}`, jobId, acc.id, acc.platform, idempotency, now, now).run();
 
         if (story_enabled) {
+          const cap = platformsCaps[acc.platform];
+          const storySupported = !cap || cap.story_support !== false;
           const storyIdempotency = crypto.createHash('sha256').update(`${jobId}:${acc.id}:story`).digest('hex').slice(0, 32);
           await env.DB.prepare(
-            `INSERT INTO job_destinations (id, job_id, account_id, platform, post_type, idempotency_key, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'story', ?, 'pending', ?, ?)`
-          ).bind(`dest_story_${crypto.randomUUID().slice(0, 8)}`, jobId, acc.id, acc.platform, storyIdempotency, now, now).run();
+            `INSERT INTO job_destinations (id, job_id, account_id, platform, post_type, idempotency_key, status, error_message, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'story', ?, ?, ?, ?, ?)`
+          ).bind(
+            `dest_story_${crypto.randomUUID().slice(0, 8)}`,
+            jobId,
+            acc.id,
+            acc.platform,
+            storyIdempotency,
+            storySupported ? 'pending' : 'skipped',
+            storySupported ? null : `Platform ${acc.platform} does not support Stories`,
+            now,
+            now
+          ).run();
         }
       }
 
-      // If publish now: initiate processing / publication pipeline immediately
-      if (publish_mode === 'now') {
-        const hasDrive = cleanLinks.some((l: string) => l.includes('drive.google.com'));
+      if (shouldDispatchImmediately) {
+        await logJobEvent(
+          env.DB,
+          jobId,
+          'dispatching',
+          'info',
+          `Attempt #1: Triggering GitHub Actions media workflow (process-media.yml) for ${cleanLinks.length} source link(s).`,
+          { attempt: 1, sources: cleanLinks }
+        );
 
-        if (cleanLinks.length === 0) {
-          // Text-only job: direct publication
-          ctx.waitUntil(executePublicationStep(env, jobId));
-        } else if (hasDrive || env.GITHUB_PAT) {
-          // Dispatch GitHub Actions workflow for Drive downloads & FFmpeg transcoding
-          await env.DB.prepare(`UPDATE jobs SET status = 'processing', updated_at = ? WHERE id = ?`).bind(now, jobId).run();
-          await logJobEvent(env.DB, jobId, 'dispatching', 'info', 'Triggering media transcode pipeline in GitHub Actions.');
+        const dispatchRes = await dispatchMediaWorkflow(env, jobId, cleanLinks, 1);
 
-          ctx.waitUntil((async () => {
-            const dispatchRes = await dispatchMediaWorkflow(env, jobId, cleanLinks);
-            if (!dispatchRes.success) {
-              // If dispatch fails, record the error and attempt direct links fallback
-              console.warn(`Dispatch failed for ${jobId}: ${dispatchRes.error}`);
-              for (let i = 0; i < cleanLinks.length; i++) {
-                const l = cleanLinks[i];
-                const isVid = /\.(mp4|mov|webm)$/i.test(l);
-                await env.DB.prepare(
-                  `INSERT INTO job_media (id, job_id, source_url, source_type, file_type, filename, asset_download_url, status, created_at)
-                   VALUES (?, ?, ?, 'direct', ?, ?, ?, 'processed', ?)`
-                ).bind(`m_${jobId}_${i}`, jobId, l, isVid ? 'video' : 'image', `media_${i}`, l, new Date().toISOString()).run();
-              }
-              await executePublicationStep(env, jobId);
-            }
-          })());
-        } else {
-          // Direct links fallback without Actions
-          for (let i = 0; i < cleanLinks.length; i++) {
-            const l = cleanLinks[i];
-            const isVid = /\.(mp4|mov|webm)$/i.test(l);
-            await env.DB.prepare(
-              `INSERT INTO job_media (id, job_id, source_url, source_type, file_type, filename, asset_download_url, status, created_at)
-               VALUES (?, ?, ?, 'direct', ?, ?, ?, 'processed', ?)`
-            ).bind(`m_${jobId}_${i}`, jobId, l, isVid ? 'video' : 'image', `media_${i}`, l, now).run();
-          }
-          ctx.waitUntil(executePublicationStep(env, jobId));
+        if (!dispatchRes.success) {
+          return jsonResponse({
+            success: false,
+            job_id: jobId,
+            publish_mode,
+            status: 'failed',
+            stage: 'dispatch',
+            error: dispatchRes.error
+          }, 502, {}, request);
         }
+
+        return jsonResponse({
+          success: true,
+          job_id: jobId,
+          publish_mode,
+          status: 'processing',
+          scheduled_at: finalSchedule,
+          workflow_run_id: dispatchRes.run_id || null,
+          workflow_run_url: dispatchRes.run_url || null
+        }, 200, {}, request);
       }
 
       return jsonResponse({
         success: true,
         job_id: jobId,
         publish_mode,
-        status: initialStatus,
+        status: 'scheduled',
         scheduled_at: finalSchedule
       }, 200, {}, request);
     }
 
-    // RETRY ACTION (Idempotent: only retries failed or pending destinations)
+    // -------------------------------------------------------------------------
+    // RETRY ACTION (F6: Rebuilds from immutable original sources, smart asset reuse, idempotent)
+    // -------------------------------------------------------------------------
     if (path.endsWith('/retry') && request.method === 'POST') {
       const jobId = path.replace('/api/jobs/', '').replace('/retry', '');
       const job = await env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(jobId).first<any>();
       if (!job) return jsonResponse({ error: 'Job not found' }, 404, {}, request);
+
+      if (job.status === 'cancelled') {
+        return jsonResponse({ error: 'Cancelled jobs cannot be retried. Create a new post if needed.' }, 400, {}, request);
+      }
+
+      if (job.status === 'processing' || job.status === 'publishing') {
+        return jsonResponse({ error: `Job is already actively ${job.status}.` }, 409, {}, request);
+      }
 
       const unfulfilled = await env.DB.prepare(
         `SELECT count(*) as count FROM job_destinations WHERE job_id = ? AND status IN ('pending', 'failed')`
@@ -1290,14 +2029,94 @@ export default {
         return jsonResponse({ error: 'All destinations are already published or skipped. Nothing to retry.' }, 400, {}, request);
       }
 
+      // Resolve immutable original sources (with automatic legacy backfill if recoverable)
+      const { sources, recovered } = await resolveOrRecoverJobSources(env.DB, job);
+      if (sources.length === 0) {
+        await logJobEvent(env.DB, jobId, 'retry_blocked', 'error', LEGACY_NO_SOURCES_MESSAGE);
+        return jsonResponse({
+          error: LEGACY_NO_SOURCES_MESSAGE,
+          stage: 'retry_validation',
+          field: 'links'
+        }, 400, {}, request);
+      }
+
+      const sourceUrls = sources.map(s => s.source_url);
+      const newAttempt = (Number(job.attempt_count) || 1) + 1;
       const now = new Date().toISOString();
-      await env.DB.prepare(`UPDATE jobs SET status = 'publishing', error_message = NULL, updated_at = ? WHERE id = ?`)
-        .bind(now, jobId).run();
-      await logJobEvent(env.DB, jobId, 'retried', 'info', 'Operator initiated idempotent retry for unfulfilled destinations.');
 
-      ctx.waitUntil(executePublicationStep(env, jobId));
+      // Reset ONLY failed destinations back to pending (never touch published or skipped destinations -> strict idempotency!)
+      await env.DB.prepare(
+        `UPDATE job_destinations SET status = 'pending', error_message = NULL, updated_at = ?
+         WHERE job_id = ? AND status = 'failed'`
+      ).bind(now, jobId).run();
 
-      return jsonResponse({ success: true, message: `Retry initiated for ${unfulfilled.count} destination(s).` }, 200, {}, request);
+      // F6.2: Check if valid processed release assets already exist on GitHub Release (size + hash verified)
+      const assetCheck = await verifyExistingReleaseAssets(env, jobId);
+
+      if (assetCheck.reusable) {
+        await env.DB.prepare(
+          `UPDATE jobs SET status = 'publishing', attempt_count = ?, error_message = NULL, updated_at = ? WHERE id = ?`
+        ).bind(newAttempt, now, jobId).run();
+
+        await logJobEvent(
+          env.DB,
+          jobId,
+          'retried',
+          'info',
+          `Attempt #${newAttempt}: Verified ${assetCheck.count} processed release asset(s) (size/hash matched); skipping reprocessing and retrying ${unfulfilled.count} unfulfilled destination(s).`,
+          { attempt: newAttempt, mode: 'reused_verified_assets', verified_assets: assetCheck.count, recovered_sources: recovered }
+        );
+
+        ctx.waitUntil(executePublicationStep(env, jobId));
+
+        return jsonResponse({
+          success: true,
+          attempt: newAttempt,
+          mode: 'reused_verified_assets',
+          message: `Attempt #${newAttempt}: Verified ${assetCheck.count} existing release asset(s); retrying ${unfulfilled.count} destination(s).`
+        }, 200, {}, request);
+      }
+
+      // Otherwise re-run processing from immutable original sources
+      await env.DB.prepare('DELETE FROM job_media WHERE job_id = ?').bind(jobId).run();
+      await env.DB.prepare(
+        `UPDATE jobs SET status = 'processing', attempt_count = ?, error_message = NULL, workflow_run_id = NULL, workflow_run_url = NULL, updated_at = ? WHERE id = ?`
+      ).bind(newAttempt, now, jobId).run();
+
+      await logJobEvent(
+        env.DB,
+        jobId,
+        'retried',
+        'info',
+        `Attempt #${newAttempt}: Re-dispatching media processing workflow from ${sourceUrls.length} saved source link(s) for ${unfulfilled.count} unfulfilled destination(s).`,
+        {
+          attempt: newAttempt,
+          mode: 're_dispatched_workflow',
+          sources: sourceUrls,
+          recovered_sources: recovered,
+          reuse_skipped_reason: assetCheck.reason
+        }
+      );
+
+      const dispatchRes = await dispatchMediaWorkflow(env, jobId, sourceUrls, newAttempt);
+
+      if (!dispatchRes.success) {
+        return jsonResponse({
+          success: false,
+          attempt: newAttempt,
+          stage: 'dispatch',
+          error: dispatchRes.error
+        }, 502, {}, request);
+      }
+
+      return jsonResponse({
+        success: true,
+        attempt: newAttempt,
+        mode: 're_dispatched_workflow',
+        workflow_run_id: dispatchRes.run_id || null,
+        workflow_run_url: dispatchRes.run_url || null,
+        message: `Attempt #${newAttempt}: Dispatched GitHub Actions media workflow (${sourceUrls.length} source link(s)) for ${unfulfilled.count} destination(s).`
+      }, 200, {}, request);
     }
 
     // CANCEL ACTION
@@ -1314,14 +2133,21 @@ export default {
     // QUEUE
     // -------------------------------------------------------------------------
     if (path === '/api/queue' && request.method === 'GET') {
-      const config = await env.DB.prepare('SELECT * FROM queue_settings WHERE id = "singleton"').first();
+      const configRow = await env.DB.prepare('SELECT * FROM queue_settings WHERE id = "singleton"').first<any>();
       const queuedJobs = await env.DB.prepare(
         `SELECT * FROM jobs WHERE status IN ('scheduled', 'pending', 'processing') ORDER BY scheduled_at ASC, created_at ASC`
       ).all();
 
-      const nextSlot = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      let dailyTimes = ['09:00', '14:00', '19:00'];
+      try {
+        if (configRow?.daily_times_json) dailyTimes = JSON.parse(configRow.daily_times_json);
+      } catch {}
+
+      const nextSlot = await calculateNextQueueSlotD1(env.DB);
       return jsonResponse({
-        config: config || { posts_per_day: 3, daily_times_json: '["09:00","14:00","19:00"]', timezone: 'Africa/Lagos' },
+        config: configRow
+          ? { ...configRow, daily_times: dailyTimes, is_active: configRow.is_active === 1 }
+          : { posts_per_day: 3, daily_times: ['09:00', '14:00', '19:00'], timezone: 'Africa/Lagos', is_active: true },
         queued_jobs: queuedJobs.results || [],
         next_available_slot: nextSlot
       }, 200, {}, request);
@@ -1368,7 +2194,7 @@ export default {
   },
 
   // ---------------------------------------------------------------------------
-  // CRON TRIGGER & WATCHDOG HANDLER (Every 5 minutes)
+  // CRON TRIGGER & INTELLIGENT WATCHDOG HANDLER (Every 5 minutes)
   // ---------------------------------------------------------------------------
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const now = new Date();
@@ -1379,7 +2205,7 @@ export default {
     try {
       const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
       const activeJobs = await env.DB.prepare(
-        `SELECT id, status, caption, created_at, updated_at, workflow_run_id, workflow_run_url FROM jobs
+        `SELECT id, status, caption, created_at, updated_at, workflow_run_id, workflow_run_url, attempt_count FROM jobs
          WHERE status IN ('pending', 'processing')
            AND updated_at <= ?
          LIMIT 10`
@@ -1391,27 +2217,24 @@ export default {
         const owner = env.GITHUB_OWNER || 'motionssalt';
         const repo = env.GITHUB_REPO || 'salt-relay';
 
-        // Check if we have an active GitHub Actions run to inspect
         if (job.workflow_run_id && env.GITHUB_PAT) {
           try {
             const runRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/runs/${job.workflow_run_id}`, {
               headers: {
                 'Authorization': `Bearer ${env.GITHUB_PAT.trim()}`,
                 'Accept': 'application/vnd.github.v3+json',
-                'User-Agent': 'SaltRelay-Worker/2.0'
+                'User-Agent': 'SaltRelay-Worker/2.1'
               }
             });
 
             if (runRes.ok) {
               const runData = await runRes.json() as any;
-              const runStatus = runData.status; // 'queued', 'in_progress', 'completed'
-              const runConclusion = runData.conclusion; // 'success', 'failure', 'cancelled', 'timed_out', etc.
+              const runStatus = runData.status;
+              const runConclusion = runData.conclusion;
               const runUrl = runData.html_url || job.workflow_run_url;
 
-              // Case A: Workflow run is actively queued or in progress
               if (runStatus === 'queued' || runStatus === 'in_progress') {
                 if (elapsedMinutes < 45) {
-                  console.log(`[Watchdog] Job ${job.id}: GitHub run #${job.workflow_run_id} is active (${runStatus}). Elapsed: ${elapsedMinutes}m. Extending deadline.`);
                   await env.DB.prepare(`UPDATE jobs SET updated_at = ? WHERE id = ?`).bind(nowIso, job.id).run();
                   await logJobEvent(
                     env.DB,
@@ -1423,8 +2246,7 @@ export default {
                   );
                   continue;
                 } else {
-                  // Exceeded 45-minute hard limit
-                  const reason = `Watchdog timeout: GitHub Actions run #${job.workflow_run_id} exceeded 45-minute hard limit. Inspect run: ${runUrl}`;
+                  const reason = `Stage [transcoding]: GitHub Actions run #${job.workflow_run_id} exceeded 45-minute hard limit. Inspect run: ${runUrl}`;
                   await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
                     .bind(reason, nowIso, job.id).run();
                   await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
@@ -1434,10 +2256,9 @@ export default {
                 }
               }
 
-              // Case B: Workflow run completed
               if (runStatus === 'completed') {
                 if (runConclusion === 'failure' || runConclusion === 'timed_out') {
-                  const reason = `GitHub Actions processing failed (${runConclusion}). Inspect run log: ${runUrl}`;
+                  const reason = `Stage [transcoding]: GitHub Actions run #${job.workflow_run_id} failed (${runConclusion}). Inspect run log: ${runUrl}`;
                   await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
                     .bind(reason, nowIso, job.id).run();
                   await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
@@ -1445,17 +2266,16 @@ export default {
                   await logJobEvent(env.DB, job.id, 'transcode_failed', 'error', reason, { run_url: runUrl, conclusion: runConclusion });
                   continue;
                 } else if (runConclusion === 'cancelled') {
-                  const reason = `GitHub Actions run was cancelled. Inspect run: ${runUrl}`;
-                  await env.DB.prepare(`UPDATE jobs SET status = 'cancelled', error_message = ?, updated_at = ? WHERE id = ?`)
+                  const reason = `Stage [transcoding]: GitHub Actions run #${job.workflow_run_id} was cancelled. Inspect run: ${runUrl}`;
+                  await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
                     .bind(reason, nowIso, job.id).run();
-                  await logJobEvent(env.DB, job.id, 'cancelled', 'warn', reason, { run_url: runUrl });
+                  await logJobEvent(env.DB, job.id, 'transcode_cancelled', 'warn', reason, { run_url: runUrl });
                   continue;
                 } else if (runConclusion === 'success') {
-                  // Run completed successfully, but no callback received
                   const runUpdated = new Date(runData.updated_at || runData.created_at).getTime();
                   const sinceRunEndMin = Math.floor((Date.now() - runUpdated) / (60 * 1000));
                   if (sinceRunEndMin >= 3) {
-                    const reason = `GitHub Actions processing finished successfully, but callback was never received by Worker. Inspect run: ${runUrl}. Retry available.`;
+                    const reason = `Stage [callback]: GitHub Actions run #${job.workflow_run_id} succeeded, but signed callback was never received by Worker. Inspect run: ${runUrl}. Retry available.`;
                     await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
                       .bind(reason, nowIso, job.id).run();
                     await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
@@ -1471,9 +2291,8 @@ export default {
           }
         }
 
-        // Fallback for jobs without workflow run ID: use 30-minute threshold
         if (elapsedMinutes >= 30) {
-          const reason = `Watchdog timeout: job remained in '${job.status}' for ${elapsedMinutes} minutes without progress.`;
+          const reason = `Stage [${job.status}]: Watchdog timeout — job remained in '${job.status}' for ${elapsedMinutes} minutes without an active workflow run.`;
           await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
             .bind(reason, nowIso, job.id).run();
           await env.DB.prepare(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`)
@@ -1482,13 +2301,12 @@ export default {
         }
       }
 
-      // Also check publishing jobs stuck for > 20 minutes
       const stuckPublishing = await env.DB.prepare(
         `SELECT id, status, updated_at FROM jobs WHERE status = 'publishing' AND updated_at <= ? LIMIT 5`
       ).bind(new Date(Date.now() - 20 * 60 * 1000).toISOString()).all<any>();
 
       for (const job of (stuckPublishing.results || [])) {
-        const reason = `Publication timeout: job remained in 'publishing' status for over 20 minutes.`;
+        const reason = `Stage [publishing]: Publication timeout — job remained in 'publishing' status for over 20 minutes.`;
         await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
           .bind(reason, nowIso, job.id).run();
         await logJobEvent(env.DB, job.id, 'publishing_timeout', 'error', reason);
@@ -1497,33 +2315,39 @@ export default {
       console.error('[Watchdog] Error running timeout checks:', watchdogErr);
     }
 
-    // 2. CRON DISPATCH: Activate due scheduled jobs
+    // 2. CRON DISPATCH: Activate due scheduled jobs from immutable job_sources
     try {
-      // Fix ISO string comparison bug: pass ISO parameter instead of datetime('now')
       const { results } = await env.DB.prepare(
-        `SELECT id, caption, raw_links_json, story_enabled FROM jobs
-         WHERE status = 'scheduled' AND scheduled_at <= ?
+        `SELECT * FROM jobs
+         WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?
          ORDER BY scheduled_at ASC LIMIT 5`
-      ).bind(nowIso).all();
+      ).bind(nowIso).all<any>();
 
-      for (const job of (results || []) as any[]) {
+      for (const job of (results || [])) {
         console.log(`[Cron Trigger] Activating due scheduled job: ${job.id}`);
-        await env.DB.prepare(`UPDATE jobs SET status = 'processing', updated_at = ? WHERE id = ?`)
-          .bind(nowIso, job.id)
-          .run();
-
-        await logJobEvent(env.DB, job.id, 'scheduled_trigger', 'info', 'Scheduled job triggered via Cloudflare Cron Trigger.');
-
-        let links: string[] = [];
-        try {
-          links = JSON.parse(job.raw_links_json || '[]');
-        } catch {}
-
-        if (links.length > 0 && (links.some((l: string) => l.includes('drive.google.com')) || env.GITHUB_PAT)) {
-          ctx.waitUntil(dispatchMediaWorkflow(env, job.id, links));
-        } else {
-          ctx.waitUntil(executePublicationStep(env, job.id));
+        const { sources } = await resolveOrRecoverJobSources(env.DB, job);
+        if (sources.length === 0) {
+          const reason = `Stage [scheduled_dispatch] (field: links): Scheduled job ${job.id} has no saved media source links and cannot dispatch.`;
+          await env.DB.prepare(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
+            .bind(reason, nowIso, job.id).run();
+          await logJobEvent(env.DB, job.id, 'dispatch_failed', 'error', reason);
+          continue;
         }
+
+        const sourceUrls = sources.map(s => s.source_url);
+        const attemptNum = Number(job.attempt_count) || 1;
+        await env.DB.prepare(`UPDATE jobs SET status = 'processing', updated_at = ? WHERE id = ?`)
+          .bind(nowIso, job.id).run();
+        await logJobEvent(
+          env.DB,
+          job.id,
+          'scheduled_trigger',
+          'info',
+          `Scheduled job due; dispatching GitHub Actions media workflow for ${sourceUrls.length} source link(s).`,
+          { attempt: attemptNum, sources: sourceUrls }
+        );
+
+        ctx.waitUntil(dispatchMediaWorkflow(env, job.id, sourceUrls, attemptNum));
       }
     } catch (cronErr) {
       console.error('[Cron Trigger] Error running scheduled jobs:', cronErr);
