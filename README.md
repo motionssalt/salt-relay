@@ -21,25 +21,32 @@ Salt Relay writes stage-by-stage events to `job_events` and `execution_logs` in 
 
 ### Where to Look When a Job Stalls or Fails
 
-1. **Job Details & Run Log Link**: Click the job in the dashboard history. If a GitHub Actions transcode run was initiated, a direct **"View Run Log"** link points straight to the specific GitHub Actions execution (`https://github.com/motionssalt/salt-relay/actions/runs/<id>`).
-2. **Job Event Timeline**: In the job drawer, scroll down to the **Event Timeline**. Each step logs timestamp, stage, and details (e.g., `dispatched`, `watchdog_extended`, `transcoded`, `publishing`, `dest_published`, `dest_failed`).
-3. **Late Callback Acceptance**: If a job was marked failed due to a temporary watchdog timeout while a long run was still progressing, the Worker automatically accepts the signed late callback when the runner finishes, recovers the job, and proceeds with publishing to unfulfilled destinations.
-4. **Idempotent Retry**: If any destinations failed (e.g. rate limit, expired API key, network blip), click the **"Retry"** button on the job card or detail view. Only unfulfilled destinations are dispatched; already-published platforms are never duplicated.
+1. **Saved Source Links & Attempt Number**: Click any job in History to inspect **Saved Source Links (`job_sources`)** and the active **Attempt #N** badge. Original media links (direct image/video URLs or public Google Drive file/folder links) are stored immutably at creation time and are never overwritten by processing steps.
+2. **Job Details & Run Log Link**: Every dispatched GitHub Actions transcode run records its exact run ID and exposes a direct **"Run Log" / "View Run Log"** link (`https://github.com/motionssalt/salt-relay/actions/runs/<id>`) both on the job card and inside the detail drawer.
+3. **Job Event Timeline**: Scroll down to the **Event Timeline** in the job detail modal to see timestamped stage transitions (`created`, `dispatching`, `dispatched`, `watchdog_extended`, `transcoded`, `publishing`, `retried`, `dest_published`, `dest_failed`).
+4. **Smart Media-Aware & Idempotent Retry**:
+   - **Verified Release Asset Reuse**: When tapping **Retry** on a `failed` or `partially_published` job, the Worker first checks GitHub Release `media-001` to verify whether all processed assets still exist with matching byte size and SHA-256 digest (`job_media.sha256`). If verified, it skips FFmpeg reprocessing and retries unfulfilled destinations immediately.
+   - **Automatic Re-Dispatch from Immutable Sources**: If release assets were not yet uploaded or were cleaned up, Retry automatically increments `attempt_count` and dispatches a fresh `process-media.yml` workflow run from the saved `job_sources` links.
+   - **Strict Per-Destination Idempotency**: Destinations already marked `published` or `skipped` are never re-sent; zero-media caption-only fallbacks are blocked at both creation and publication stages.
+   - **Legacy Job Guard**: If an older job genuinely has no saved media links anywhere, Retry refuses immediately with `"This job's original media links were not saved, so it cannot be retried. Create a new post."`
+5. **Late Callback Acceptance**: If a job was marked failed due to a temporary watchdog timeout while a long run was still progressing, the Worker automatically accepts the signed HMAC late callback when the runner finishes, recovers unfulfilled destinations, and completes publication.
 
 ### Stage Reference
 
 | Stage | What Happens | Where to Look If Stalled |
 | :--- | :--- | :--- |
-| `created` | Post record and per-destination tracking rows inserted into D1. | Check `/api/jobs` and `job_destinations` in D1. |
-| `dispatching` / `dispatched` | Worker calls GitHub Actions `workflow_dispatch` on `process-media.yml`, captures workflow run ID & URL. | Verify Worker has valid `GITHUB_PAT` secret with `repo`+`workflow` scopes. |
-| `transcoding` | GitHub Actions runner downloads media (Drive / direct link) and transcodes via static FFmpeg binary. | Click "View Run Log" in the job details to inspect real-time transcode progress. |
-| `uploaded` | Runner uploads transcoded media to temporary GitHub Release asset (`media-001`) with HTTP verification. | GitHub repository **Releases** tab (`media-001`). Runner verifies asset presence via API. |
-| `publishing` | Runner posts signed HMAC webhook to `/api/callback/media-processed`, Worker starts Zernio dispatch. | Check `CALLBACK_SECRET` match between Worker & Actions. Check Zernio API response in `job_events`. |
-| `published` / `partially_published` | Zernio confirms publication to social platforms. External IDs & URLs recorded. | View Destination Breakdown in the dashboard or click external post links. |
-| `failed` | Error recorded with exact failure reason from platform or transcode runner. | Check error banner; click "Retry" to re-attempt unfulfilled destinations safely. |
-| `watchdog_extended` | Watchdog inspected GitHub Actions run, confirmed it is actively `queued` or `in_progress`, and extended the deadline. | Normal behavior for longer media files. The hard limit is 45 minutes. |
-| `watchdog_timeout` | Run exceeded 45-minute hard limit or orphan job had no activity for > 30 minutes. | Check the GitHub run link on the job card to see if runner stalled. |
-| `cancelled` | Operator explicitly cancelled the job. Cancelled jobs are permanently sealed and never auto-resurrect. | Marked by operator action in dashboard. |
+| `create_validation` | Validates at least 1 valid `http(s)` direct media URL or Google Drive file/folder URL with ID, plus schedule UTC normalization. | Composer error banner / `POST /api/jobs` HTTP 400 `stage` + `field` response. |
+| `created` | Job, immutable `job_sources` rows (`sources_json`), and per-destination rows inserted into D1. | Check `/api/jobs/:id` -> `sources` & `job_destinations` in D1. |
+| `dispatching` / `dispatched` | Worker calls GitHub Actions `workflow_dispatch` on `process-media.yml` (immediately for `now` or due schedules) and records run ID & URL. | Verify Worker has valid `GITHUB_PAT` secret with `repo`+`workflow` scopes; inspect `dispatch_failed` event if HTTP != 204. |
+| `transcoding` | GitHub Actions runner expands Drive folders/files, downloads media, and transcodes via cached static FFmpeg binary (`libx264` + `aac`). | Click **"Run Log"** on the job card or detail modal to inspect real-time FFmpeg progress. |
+| `transcoded` | Runner uploads transcoded media to GitHub Release (`media-001`), verifies HTTP 201 + asset size + SHA-256, and sends signed HMAC callback. | GitHub repository **Releases** tab (`media-001`) and `job_media` table in D1. |
+| `publishing` | Worker guards against 0-media payloads and dispatches media URLs via `/api/public/media/:jobId/:assetName` (302 signed CDN redirect) to Zernio. | Check `CALLBACK_SECRET` match between Worker & Actions; inspect Zernio API status in `job_events`. |
+| `retried` | Operator triggered Retry (`Attempt #N`): either reused size/SHA-256-verified release assets or re-dispatched `process-media.yml` from `job_sources`. | Job detail modal (`Attempt #N`, `Event Timeline`, and `View Run Log`). |
+| `published` / `partially_published` | Zernio confirms publication. Temporary release assets on `media-001` are deleted only once all non-skipped destinations are `published`. | View Target Destinations breakdown or click external post links. |
+| `failed` | Specific stage & error message recorded from validation, GitHub dispatch, FFmpeg runner, or Zernio platform API. | Check red Execution Error banner; tap **Retry** to re-run unfulfilled destinations with media. |
+| `watchdog_extended` | Cron watchdog queried GitHub Actions API, confirmed the run is actively `queued` or `in_progress`, and extended deadline (up to 45m hard cap). | Normal for large multi-video Drive folders. |
+| `watchdog_timeout` | Run exceeded 45-minute hard cap or runner failed/cancelled without callback. | Click **"Run Log"** on the job card to inspect the GitHub Actions failure step. |
+| `cancelled` | Operator explicitly cancelled the job. Cancelled jobs are permanently sealed and never auto-resurrect on late callbacks. | Marked by operator action in dashboard. |
 
 ---
 

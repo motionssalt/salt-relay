@@ -2,8 +2,8 @@
   "project": "salt-relay",
   "repo": "motionssalt/salt-relay",
   "goal": "Complete FIX PROMPT 2: F1-F4 (callback, fast FFmpeg, smart watchdog, dry-run) + F5 (immutable media sources, source validation, immediate/timezone-accurate dispatch) + F6 (media-aware Retry from immutable sources, verified asset reuse, legacy source backfill & UI visibility)",
-  "status": "in_progress",
-  "current_phase": "F5_immutable_sources_and_dispatch",
+  "status": "completed",
+  "current_phase": "completed",
   "phases": [
     "F1_callback_and_upload",
     "F2_fast_ffmpeg",
@@ -17,66 +17,77 @@
       "id": "F1",
       "title": "Fix CALLBACK_URL is not defined ReferenceError, verify release upload, add retries and failure callback",
       "status": "done",
-      "notes": "Root cause resolved: declared CALLBACK_URL in scripts/process-media-runner.cjs, added startup fail-fast validation for JOB_ID, CALLBACK_URL, CALLBACK_SECRET, GITHUB_TOKEN; added explicit permissions: contents: write to process-media.yml; verified release asset upload HTTP status 201 + API presence verification; implemented 5-attempt exponential backoff callback and catch-all error failure callback; updated Worker callback handler to accept signed late callbacks for watchdog-failed jobs and protect cancelled jobs."
+      "notes": "Declared CALLBACK_URL in scripts/process-media-runner.cjs, added startup fail-fast validation for JOB_ID, CALLBACK_URL, CALLBACK_SECRET, MEDIA_JSON, GITHUB_TOKEN; added permissions: contents: write to process-media.yml; verified release asset upload HTTP 201 + API size/presence + SHA-256 hash; implemented 5-attempt exponential backoff callback and catch-all failure callback; updated Worker callback handler to accept signed late callbacks for watchdog-failed jobs and protect cancelled jobs."
     },
     {
       "id": "F2",
       "title": "Replace slow apt FFmpeg install with cached static binary build (<1 min) and resilient fallback",
       "status": "done",
-      "notes": "Replaced slow 30-minute apt install (99 packages) with fast static FFmpeg binary download directly from GitHub Release CDN cached via actions/cache@v4 on /opt/ffmpeg; added resilient apt fallback with --no-install-recommends; verified libx264 and aac encoders; added timeout-minutes (25m job, 5m install step). Verified run 40174497220 executed entire workflow in 33 seconds (FFmpeg install + verification in ~12 seconds)."
+      "notes": "Upgraded workflow actions to Node 24 native versions (actions/checkout@v6, actions/setup-node@v6, actions/cache@v5); pinned BtbN FFmpeg 8.1 static GPL binary cached on /opt/ffmpeg with secondary static URL + apt --no-install-recommends fallback; verified libx264, aac, and scale filter. Live timing verified: cold FFmpeg install = 12.0s (run 40250665253), warm cached FFmpeg install = 1.0s (run 40250825830), down from 30m 03s."
     },
     {
       "id": "F3",
       "title": "Upgrade watchdog from blind 15-minute timer to query real GitHub Actions run status",
       "status": "done",
-      "notes": "Added workflow_run_id and workflow_run_url columns to D1 jobs table (migration 0003); updated dispatchMediaWorkflow to capture run ID and URL upon dispatch; rewrote scheduled watchdog in worker/index.ts to query GitHub Actions API: extends deadline for in_progress/queued runs up to 45m hard limit, immediately fails on runner failure/cancellation with direct run link, detects uncalled callbacks after run success; exposed workflow run links in HistoryTab UI and types."
+      "notes": "Added workflow_run_id and workflow_run_url columns to D1 jobs table (migration 0003); updated dispatchMediaWorkflow to filter runs by created_at >= dispatchStartedMs - 15s and store run ID and URL; rewrote scheduled watchdog in worker/index.ts to query GitHub Actions API (extends deadline up to 45m hard cap while queued/in_progress, fails immediately on runner failure/cancellation with direct run link); exposed Run Log links on job cards and modal."
     },
     {
       "id": "F4",
       "title": "Clean up failed test job job_878cb83e-c and perform dry-run verification of complete pipeline",
       "status": "done",
-      "notes": "Inspected release media-001 assets: confirmed no orphan asset was uploaded for job_878cb83e-c (left untouched in failed state for Victor to press Retry); executed end-to-end dry run (job_e2e_dryrun_success) with public video through dispatch -> run 40174497220 -> fast static FFmpeg transcode -> release upload (Asset ID 674436839) -> HMAC signed callback -> Worker publication check (no destinations published) -> verified public media proxy /api/public/media/ with 302 redirect to signed CDN URL -> cleaned up test asset and test rows; updated README with troubleshooting guide."
+      "notes": "Confirmed release media-001 has 0 orphan assets; left job_878cb83e-c and job_15f599e2-c untouched in failed state with backfilled job_sources for Victor to tap Retry; verified public media proxy /api/public/media/:jobId/:assetName returns HTTP 302 to signed release-assets.githubusercontent.com CDN URL (HEAD HTTP 200, exact Content-Length); cleaned up all temporary dry-run assets and rows; updated README troubleshooting guide."
     },
     {
       "id": "F5",
       "title": "New posts never dispatch the workflow and fail with media files required (persist immutable sources, fix validation, timezone schedule & immediate dispatch)",
-      "status": "in_progress",
-      "notes": "Root cause proven via remote D1 (job_15f599e2-c) and worker/index.ts (commit 922b189): (1) CreatePostTab sent naive local datetime-local (2026-10-26T00:43 Africa/Lagos = 23:43Z, already due at 23:57Z) without UTC conversion, and POST /api/jobs left due scheduled jobs un-dispatched; (2) HistoryTab showed No media attached (Text post) because job_media is empty before Actions runs, and exposed Retry on scheduled jobs, which bypassed Actions and failed at Zernio with Tiktok posts require media content; (3) POST /api/jobs also allowed empty links[] when caption was present and had a broken direct-link fallback on dispatch failure."
+      "status": "done",
+      "notes": "Applied remote D1 migration 0004_immutable_job_sources_and_attempts.sql creating immutable job_sources table plus jobs.sources_json, jobs.attempt_count, jobs.dry_run, and job_media.asset_id/sha256; enforced strict create_validation rejecting empty links[] or malformed/ID-less Google Drive URLs with HTTP 400 naming stage and field; normalized naive scheduled_at from Africa/Lagos (UTC+1) / browser timezone to canonical UTC ISO and immediately dispatched due schedules and publish_mode=now; deleted broken raw-URL dispatch fallback and surfaced real scrubbed GitHub HTTP status/response; verified live with dry-run run 40250665253 (direct MP4 + Google Drive file link)."
     },
     {
       "id": "F6",
       "title": "Retry sends only caption and hashtags, never the media (rebuild Retry from stored immutable sources with verified asset reuse and UI visibility)",
-      "status": "pending",
-      "notes": "Root cause proven via remote D1 (job_878cb83e-c & job_15f599e2-c) and worker/index.ts lines 1280-1301 (commit 922b189): POST /api/jobs/:id/retry jumped directly to executePublicationStep() reading job_media (0 rows when transcode failed or had not run) instead of reading original media sources and dispatching process-media.yml, sending caption+hashtags only to Zernio."
+      "status": "done",
+      "notes": "Rebuilt POST /api/jobs/:id/retry to read immutable job_sources (auto-backfilling legacy jobs where links exist), verify existing release assets on media-001 by size + SHA-256 for smart fast-path reuse (mode: reused_verified_assets), or re-dispatch process-media.yml from original sources (mode: re_dispatched_workflow) while incrementing attempt_count and preserving published/skipped destinations (strict idempotency); added 0-media guard in executePublicationStep and exact F6.3 error message for legacy jobs without sources; backfilled Victor's existing jobs in remote D1; updated HistoryTab UI to display Saved Source Links count/URLs and Attempt #N; verified live via smart reuse (Attempt #2) and full cached re-dispatch run 40250825830 (Attempt #3, 33s total)."
     }
   ],
   "completed": [
-    "F1: Fixed CALLBACK_URL is not defined in scripts/process-media-runner.cjs and updated Worker callback handler",
-    "F2: Accelerated FFmpeg installation from 30m 3s to 12s via cached static binary with apt fallback",
-    "F3: Upgraded watchdog to track actual GitHub Actions run status and added run log links in UI",
-    "F4: Verified no orphaned assets for job_878cb83e-c, proved entire chain with green run 40174497220, confirmed public media proxy 302 redirect, and cleaned up test assets"
+    "F1: Fixed CALLBACK_URL ReferenceError, verified release upload HTTP 201 + SHA-256, added 5x callback backoff + failure callback + late callback recovery",
+    "F2: Accelerated FFmpeg installation from 30m 03s to 12.0s cold (run 40250665253) and 1.0s warm cached (run 40250825830) on Node 24 actions",
+    "F3: Upgraded watchdog to query GitHub Actions run status and exposed direct Run Log links on job cards and modal",
+    "F4: Verified 0 orphan assets on media-001, confirmed /api/public/media 302 -> HTTP 200 signed CDN stream, and updated README troubleshooting guide",
+    "F5: Persisted immutable job_sources via D1 migration 0004, enforced link/Drive-ID validation, fixed Africa/Lagos schedule UTC normalization & immediate dispatch, and removed broken raw-URL fallback",
+    "F6: Rebuilt Retry from immutable job_sources with SHA-256/size asset reuse, strict per-destination idempotency, legacy job guard + backfill, 7 automated tests, and Saved Source Links + Attempt #N UI"
   ],
   "next_steps": [
-    "Victor to test live retry of job_878cb83e-c directly from the mobile dashboard at https://salt-relay.pages.dev"
+    "Victor to open https://salt-relay.pages.dev on mobile, tap Retry on job_878cb83e-c (or job_15f599e2-c) in History, or submit one new test post to confirm live social publishing."
   ],
   "decisions": [
     "Added permissions: contents: write to .github/workflows/process-media.yml so GITHUB_TOKEN has write authorization for releases.",
-    "Worker media proxy supports HEAD requests and redirects client with HTTP 302 directly to signed GitHub/Azure storage blob URL, avoiding worker CPU and memory constraints during platform video ingest.",
-    "Worker accepts valid signed late callbacks for jobs previously failed by watchdog, resetting destination failures and continuing publication, while strictly preserving operator cancellation on cancelled jobs.",
-    "Left job_878cb83e-c untouched as instructed; no orphan asset existed on media-001 because GITHUB_TOKEN write failure previously aborted before upload."
+    "Upgraded GitHub Actions steps to Node 24 native versions (actions/checkout@v6, actions/setup-node@v6, actions/cache@v5) and pinned FFmpeg 8.1 static GPL binary with secondary static mirror + apt --no-install-recommends fallback.",
+    "Persisted submitted media URLs immutably in both normalized job_sources rows and jobs.sources_json via migration 0004; callback/publication writes only to job_media and never mutates job_sources.",
+    "Normalized naive datetime-local scheduled_at strings against Africa/Lagos (UTC+1) on the Worker and converted browser-local schedules to UTC ISO in CreatePostTab, dispatching immediately whenever scheduled_at <= now + 30s.",
+    "Smart Retry checks GitHub Release media-001 for matching asset_id/asset_name, byte size, and SHA-256 digest before skipping FFmpeg; if missing or mismatched, it increments attempt_count and re-dispatches process-media.yml from job_sources while leaving already-published/skipped destinations untouched.",
+    "Backfilled remote D1 job_sources for existing jobs (job_878cb83e-c, job_15f599e2-c, job_971ea14d-e) without altering their status or retrying them so Victor can test Retry directly."
   ],
-  "known_issues": [
-    "F5: POST /api/jobs (commit 922b189) allows empty links when caption is non-empty, stores naive datetime-local scheduled_at without Africa/Lagos->UTC normalization, fails to dispatch due scheduled jobs immediately, and falls back to raw unexpanded URLs on GitHub dispatch failure.",
-    "F6: POST /api/jobs/:id/retry (commit 922b189) calls executePublicationStep() directly without checking/reusing release assets or re-dispatching process-media.yml from original sources, causing caption-only publishes when job_media has 0 processed rows."
+  "known_issues": [],
+  "required_secrets_names_only": [
+    "GITHUB_PAT",
+    "CLOUDFLARE_API_TOKEN",
+    "CALLBACK_SECRET",
+    "ENCRYPTION_KEY",
+    "DASHBOARD_PASSWORD",
+    "SESSION_SECRET"
   ],
   "deployment": {
     "worker": "salt-relay-api",
     "worker_url": "https://salt-relay-api.motionssalt.workers.dev",
+    "pages_project": "salt-relay",
     "pages_url": "https://salt-relay.pages.dev",
     "d1_database_id": "29f8c89b-41cf-4b7e-906c-a475eb06febc",
     "active_release": "media-001",
-    "last_successful_run_id": "40174497220"
+    "cold_ffmpeg_run_id": "40250665253",
+    "warm_cached_retry_run_id": "40250825830"
   },
-  "last_updated": "2026-10-26T00:19:46.710Z",
-  "last_session_note": "Started F5 and F6 investigation; proven root causes from remote D1 jobs job_15f599e2-c and job_878cb83e-c and git history (commit 922b189). Writing reproduction test suite next."
+  "last_updated": "2026-10-26T00:46:00.000Z",
+  "last_session_note": "Completed F1-F6 implementation, 7/7 automated SQLite/Worker tests, remote D1 migration 0004 + backfill, Worker & Pages deployment, and live end-to-end dry-run verification (runs 40250665253 & 40250825830) with full cleanup."
 }
