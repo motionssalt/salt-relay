@@ -53,6 +53,48 @@ function verifyPassword(candidate: string): boolean {
 
 app.use(express.json());
 
+const LIVE_WORKER_ORIGIN = 'https://salt-relay-api.motionssalt.workers.dev';
+const LEGACY_NO_SOURCES_MESSAGE =
+  "This job's original media links were not saved, so it cannot be retried. Create a new post.";
+
+// When running in preview environments without local D1/password secrets, proxy /api/* to the live Cloudflare Worker
+app.use('/api', async (req, res, next) => {
+  if (DASHBOARD_PASSWORD || DASHBOARD_PASSWORD_HASH) {
+    return next();
+  }
+  try {
+    const targetUrl = `${LIVE_WORKER_ORIGIN}${req.originalUrl}`;
+    const fwdHeaders: Record<string, string> = {
+      'Accept': req.headers['accept'] || 'application/json',
+      'Content-Type': req.headers['content-type'] || 'application/json'
+    };
+    if (req.headers['authorization']) fwdHeaders['Authorization'] = String(req.headers['authorization']);
+    if (req.headers['cookie']) fwdHeaders['Cookie'] = String(req.headers['cookie']);
+    if (req.headers['x-session-token']) fwdHeaders['X-Session-Token'] = String(req.headers['x-session-token']);
+    if (req.headers['x-callback-signature']) fwdHeaders['X-Callback-Signature'] = String(req.headers['x-callback-signature']);
+
+    const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+    const upstream = await fetch(targetUrl, {
+      method: req.method,
+      headers: fwdHeaders,
+      body: hasBody && req.body && Object.keys(req.body).length > 0 ? JSON.stringify(req.body) : undefined,
+      redirect: 'manual'
+    });
+
+    const setCookie = upstream.headers.get('set-cookie');
+    if (setCookie) res.setHeader('Set-Cookie', setCookie);
+    const location = upstream.headers.get('location');
+    if (location) res.setHeader('Location', location);
+    const contentType = upstream.headers.get('content-type');
+    if (contentType) res.setHeader('Content-Type', contentType);
+
+    const text = await upstream.text();
+    return res.status(upstream.status).send(text);
+  } catch (err: any) {
+    return res.status(502).json({ error: `Upstream Worker proxy failed: ${err.message}` });
+  }
+});
+
 // Helper auth middleware
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   const cookieHeader = req.headers.cookie || '';
@@ -336,6 +378,32 @@ app.get('/api/jobs', requireAuth, async (req, res) => {
   }
 });
 
+function classifyLocalSourceUrl(rawUrl: string): { valid: boolean; kind?: 'direct_url' | 'drive_file' | 'drive_folder'; normalizedUrl?: string; error?: string } {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) return { valid: false, error: 'Source URL cannot be empty.' };
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { valid: false, error: `Invalid URL syntax: "${trimmed.slice(0, 80)}"` };
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { valid: false, error: 'URL must start with http:// or https://.' };
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (host === 'drive.google.com' || host.endsWith('.drive.google.com') || host === 'docs.google.com') {
+    const folderMatch = parsed.pathname.match(/\/drive\/(?:u\/\d+\/)?folders\/([a-zA-Z0-9_-]{10,})/);
+    if (folderMatch) return { valid: true, kind: 'drive_folder', normalizedUrl: trimmed };
+    const fileMatch = parsed.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]{10,})/);
+    const queryId = parsed.searchParams.get('id');
+    if (fileMatch || (queryId && /^[a-zA-Z0-9_-]{10,}$/.test(queryId))) {
+      return { valid: true, kind: 'drive_file', normalizedUrl: trimmed };
+    }
+    return { valid: false, error: 'Google Drive link is missing a valid file or folder ID.' };
+  }
+  return { valid: true, kind: 'direct_url', normalizedUrl: trimmed };
+}
+
 app.get('/api/jobs/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -345,15 +413,25 @@ app.get('/api/jobs/:id', requireAuth, async (req, res) => {
     }
 
     const job = jobs[0];
+    let sources: any[] = [];
+    try {
+      sources = await queryD1<any>('SELECT * FROM job_sources WHERE job_id = ? ORDER BY position ASC', [id]);
+    } catch {}
     const media = await queryD1<any>('SELECT * FROM job_media WHERE job_id = ? ORDER BY created_at ASC', [id]);
     const destinations = await queryD1<any>('SELECT * FROM job_destinations WHERE job_id = ? ORDER BY platform ASC', [id]);
     const logs = await queryD1<any>('SELECT * FROM execution_logs WHERE job_id = ? ORDER BY created_at ASC', [id]);
+    let events: any[] = [];
+    try {
+      events = await queryD1<any>('SELECT * FROM job_events WHERE job_id = ? ORDER BY created_at ASC', [id]);
+    } catch {}
 
     res.json({
       job,
+      sources,
       media,
       destinations,
-      logs
+      logs,
+      events
     });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
@@ -363,39 +441,93 @@ app.get('/api/jobs/:id', requireAuth, async (req, res) => {
 app.post('/api/jobs', requireAuth, async (req, res) => {
   try {
     const {
-      caption,
+      caption = '',
       hashtags = '',
       links = [],
-      publish_mode = 'now', // 'now', 'queue', 'schedule'
+      publish_mode = 'now',
       scheduled_at,
+      timezone = 'Africa/Lagos',
       story_enabled = false,
-      selected_destinations = [] // array of account ids
+      selected_destinations = []
     } = req.body;
 
-    if (!caption && links.length === 0) {
-      return res.status(400).json({ error: 'Caption or media links are required' });
+    if (!Array.isArray(links)) {
+      return res.status(400).json({
+        error: 'Validation failed [stage: create_validation, field: links]: links must be an array of media URLs.',
+        stage: 'create_validation',
+        field: 'links'
+      });
     }
 
-    const jobId = `job_${crypto.randomUUID().slice(0, 10)}`;
-    const now = new Date().toISOString();
+    const nonEmpty = links.map((l: any) => String(l ?? '').trim()).filter((l: string) => l.length > 0);
+    if (nonEmpty.length === 0) {
+      return res.status(400).json({
+        error: 'Validation failed [stage: create_validation, field: links]: At least one media source link (direct image/video URL or public Google Drive file/folder link) is required.',
+        stage: 'create_validation',
+        field: 'links'
+      });
+    }
 
-    let finalSchedule = scheduled_at || null;
-    let initialStatus = 'pending';
+    const validatedSources: Array<{ position: number; source_url: string; source_kind: string }> = [];
+    for (let i = 0; i < nonEmpty.length; i++) {
+      const check = classifyLocalSourceUrl(nonEmpty[i]);
+      if (!check.valid || !check.kind || !check.normalizedUrl) {
+        return res.status(400).json({
+          error: `Validation failed [stage: create_validation, field: links[${i}]]: ${check.error}`,
+          stage: 'create_validation',
+          field: `links[${i}]`
+        });
+      }
+      validatedSources.push({ position: i, source_url: check.normalizedUrl, source_kind: check.kind });
+    }
+
+    let finalSchedule: string | null = null;
+    let shouldDispatchImmediately = publish_mode === 'now';
 
     if (publish_mode === 'queue') {
       finalSchedule = await calculateNextQueueSlot();
-      initialStatus = 'scheduled';
     } else if (publish_mode === 'schedule') {
-      initialStatus = 'scheduled';
+      if (!scheduled_at) {
+        return res.status(400).json({
+          error: 'Validation failed [stage: create_validation, field: scheduled_at]: scheduled_at is required when publish_mode is schedule.',
+          stage: 'create_validation',
+          field: 'scheduled_at'
+        });
+      }
+      const parsed = new Date(scheduled_at);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({
+          error: 'Validation failed [stage: create_validation, field: scheduled_at]: Invalid date/time.',
+          stage: 'create_validation',
+          field: 'scheduled_at'
+        });
+      }
+      finalSchedule = parsed.toISOString();
+      if (parsed.getTime() <= Date.now() + 30 * 1000) {
+        shouldDispatchImmediately = true;
+      }
     }
 
+    const cleanLinks = validatedSources.map(s => s.source_url);
+    const sourcesJson = JSON.stringify(cleanLinks);
+    const jobId = `job_${crypto.randomUUID().slice(0, 10)}`;
+    const now = new Date().toISOString();
+    const initialStatus = shouldDispatchImmediately ? 'processing' : 'scheduled';
+
     await executeD1(
-      `INSERT INTO jobs (id, caption, hashtags, raw_links_json, publish_mode, status, story_enabled, scheduled_at, timezone, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Africa/Lagos', ?, ?)`,
-      [jobId, caption.trim(), hashtags.trim(), JSON.stringify(links), publish_mode, initialStatus, story_enabled ? 1 : 0, finalSchedule, now, now]
+      `INSERT INTO jobs (id, caption, hashtags, raw_links_json, sources_json, publish_mode, status, story_enabled, scheduled_at, timezone, attempt_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      [jobId, String(caption || '').trim(), String(hashtags || '').trim(), sourcesJson, sourcesJson, publish_mode, initialStatus, story_enabled ? 1 : 0, finalSchedule, timezone, now, now]
     );
 
-    // Fetch destination account objects
+    for (const s of validatedSources) {
+      await executeD1(
+        `INSERT INTO job_sources (id, job_id, position, source_url, source_kind, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [`src_${jobId}_${s.position}`, jobId, s.position, s.source_url, s.source_kind, now]
+      );
+    }
+
     let accounts: any[] = [];
     if (selected_destinations.length > 0) {
       const placeholders = selected_destinations.map(() => '?').join(',');
@@ -404,12 +536,8 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
       accounts = await queryD1<any>('SELECT * FROM accounts WHERE is_active = 1');
     }
 
-    // Insert pending job_destinations
     for (const acc of accounts) {
-      const idempotency = crypto.createHash('sha256')
-        .update(`${jobId}:${acc.id}:init`)
-        .digest('hex').slice(0, 32);
-
+      const idempotency = crypto.createHash('sha256').update(`${jobId}:${acc.id}:feed`).digest('hex').slice(0, 32);
       await executeD1(
         `INSERT INTO job_destinations (id, job_id, account_id, platform, post_type, idempotency_key, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'feed', ?, 'pending', ?, ?)`,
@@ -417,10 +545,7 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
       );
 
       if (story_enabled) {
-        const storyIdempotency = crypto.createHash('sha256')
-          .update(`${jobId}:${acc.id}:story:init`)
-          .digest('hex').slice(0, 32);
-
+        const storyIdempotency = crypto.createHash('sha256').update(`${jobId}:${acc.id}:story`).digest('hex').slice(0, 32);
         await executeD1(
           `INSERT INTO job_destinations (id, job_id, account_id, platform, post_type, idempotency_key, status, created_at, updated_at)
            VALUES (?, ?, ?, ?, 'story', ?, 'pending', ?, ?)`,
@@ -429,11 +554,18 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
       }
     }
 
-    // If "Publish Now", initiate processing pipeline immediately
-    if (publish_mode === 'now') {
-      triggerJobProcessing(jobId, links).catch(err => {
-        console.error(`Error triggering processing for job ${jobId}:`, err);
-      });
+    if (shouldDispatchImmediately) {
+      const dispatchErr = await triggerJobProcessing(jobId, cleanLinks);
+      if (dispatchErr) {
+        return res.status(502).json({
+          success: false,
+          job_id: jobId,
+          publish_mode,
+          status: 'failed',
+          stage: 'dispatch',
+          error: dispatchErr
+        });
+      }
     }
 
     res.json({
@@ -448,58 +580,37 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
   }
 });
 
-// Trigger media workflow or direct publication
-async function triggerJobProcessing(jobId: string, rawLinks: string[]) {
+// Trigger media workflow strictly (never fall back to raw unexpanded URLs or 0-media publishes)
+async function triggerJobProcessing(jobId: string, sourceLinks: string[]): Promise<string | null> {
   const now = new Date().toISOString();
-  await executeD1('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', ['processing', now, jobId]);
-
-  await executeD1(
-    `INSERT INTO execution_logs (id, job_id, level, message, details_json, created_at)
-     VALUES (?, ?, 'info', 'Initiating media processing workflow', ?, ?)`,
-    [`log_${crypto.randomUUID().slice(0, 8)}`, jobId, JSON.stringify({ links: rawLinks }), now]
-  );
-
-  if (rawLinks.length === 0) {
-    // Text-only job, directly publish
-    await executePublicationStep(jobId);
-    return;
+  if (!sourceLinks || sourceLinks.length === 0) {
+    const msg = 'Stage [dispatch]: Cannot dispatch media workflow with 0 media source links.';
+    await executeD1(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`, [msg, now, jobId]);
+    await executeD1(`UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status = 'pending'`, [msg, now, jobId]);
+    return msg;
   }
 
-  // Dispatch GitHub Actions workflow
+  await executeD1('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', ['processing', now, jobId]);
   const callbackUrl = `${APP_URL}/api/callback/media-processed`;
   try {
-    const dispatch = await dispatchMediaWorkflow(jobId, JSON.stringify(rawLinks), callbackUrl, CALLBACK_SECRET);
+    const dispatch = await dispatchMediaWorkflow(jobId, JSON.stringify(sourceLinks), callbackUrl, CALLBACK_SECRET);
     if (dispatch.status >= 200 && dispatch.status < 300) {
       await executeD1(
         `INSERT INTO execution_logs (id, job_id, level, message, details_json, created_at)
-         VALUES (?, ?, 'info', 'GitHub Actions media processing workflow dispatched', null, ?)`,
-        [`log_${crypto.randomUUID().slice(0, 8)}`, jobId, new Date().toISOString()]
+         VALUES (?, ?, 'info', 'GitHub Actions media processing workflow dispatched', ?, ?)`,
+        [`log_${crypto.randomUUID().slice(0, 8)}`, jobId, JSON.stringify({ links: sourceLinks }), new Date().toISOString()]
       );
-    } else {
-      throw new Error(`Workflow dispatch returned HTTP ${dispatch.status}: ${JSON.stringify(dispatch.data)}`);
+      return null;
     }
+    throw new Error(`Stage [dispatch]: GitHub Actions workflow dispatch failed (HTTP ${dispatch.status}): ${JSON.stringify(dispatch.data)}`);
   } catch (err: any) {
-    // If GitHub actions dispatch is unavailable, fall back to direct links publication
-    console.warn(`GitHub Actions dispatch error for job ${jobId}, proceeding with direct links:`, err.message);
+    const failMsg = err.message || 'Stage [dispatch]: GitHub Actions workflow dispatch failed.';
+    await executeD1(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`, [failMsg, new Date().toISOString(), jobId]);
     await executeD1(
-      `INSERT INTO execution_logs (id, job_id, level, message, details_json, created_at)
-       VALUES (?, ?, 'warn', 'GitHub Actions unavailable, processing directly with links', ?, ?)`,
-      [`log_${crypto.randomUUID().slice(0, 8)}`, jobId, JSON.stringify({ error: err.message }), new Date().toISOString()]
+      `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status = 'pending'`,
+      [failMsg, new Date().toISOString(), jobId]
     );
-
-    // Save direct links into job_media
-    for (let i = 0; i < rawLinks.length; i++) {
-      const url = rawLinks[i];
-      const mediaId = `media_${jobId}_${i}`;
-      const isVideo = /\.(mp4|mov|webm)$/i.test(url);
-      await executeD1(
-        `INSERT INTO job_media (id, job_id, source_url, source_type, file_type, filename, asset_download_url, status, created_at)
-         VALUES (?, ?, ?, 'direct', ?, ?, ?, 'processed', ?)`,
-        [mediaId, jobId, url, isVideo ? 'video' : 'image', `direct_media_${i}`, url, new Date().toISOString()]
-      );
-    }
-
-    await executePublicationStep(jobId);
+    return failMsg;
   }
 }
 
@@ -610,6 +721,16 @@ async function executePublicationStep(jobId: string) {
   await executeD1('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', ['publishing', now, jobId]);
 
   const mediaAssets = await queryD1<any>('SELECT * FROM job_media WHERE job_id = ? AND status = ?', [jobId, 'processed']);
+  if (!mediaAssets || mediaAssets.length === 0) {
+    const noMediaMsg = 'Stage [publication_guard]: Refusing to publish without processed media assets.';
+    await executeD1(`UPDATE jobs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`, [noMediaMsg, now, jobId]);
+    await executeD1(
+      `UPDATE job_destinations SET status = 'failed', error_message = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'publishing')`,
+      [noMediaMsg, now, jobId]
+    );
+    return;
+  }
+
   const destinations = await queryD1<any>(
     `SELECT jd.id as destination_db_id, jd.account_id, jd.platform, jd.post_type, jd.status, a.platform_account_id, a.key_id
      FROM job_destinations jd
@@ -744,14 +865,55 @@ async function cleanupJobReleaseAssets(jobId: string) {
   );
 }
 
-// Retry failed destinations route
+// Retry failed destinations route (rebuilds from immutable job_sources, never sends caption-only)
 app.post('/api/jobs/:id/retry', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    executePublicationStep(id).catch(err => {
-      console.error(`Retry execution error for ${id}:`, err);
+    const jobs = await queryD1<any>('SELECT * FROM jobs WHERE id = ?', [id]);
+    if (!jobs || jobs.length === 0) return res.status(404).json({ error: 'Job not found' });
+    const job = jobs[0];
+    if (job.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cancelled jobs cannot be retried.' });
+    }
+
+    let sourceUrls: string[] = [];
+    try {
+      const rows = await queryD1<any>('SELECT source_url FROM job_sources WHERE job_id = ? ORDER BY position ASC', [id]);
+      sourceUrls = rows.map(r => String(r.source_url || '').trim()).filter(Boolean);
+    } catch {}
+    if (sourceUrls.length === 0) {
+      for (const col of [job.sources_json, job.raw_links_json]) {
+        if (!col) continue;
+        try {
+          const parsed = JSON.parse(col);
+          if (Array.isArray(parsed)) {
+            sourceUrls = parsed.map((u: any) => String(u || '').trim()).filter(Boolean);
+            if (sourceUrls.length > 0) break;
+          }
+        } catch {}
+      }
+    }
+
+    if (sourceUrls.length === 0) {
+      return res.status(400).json({ error: LEGACY_NO_SOURCES_MESSAGE, stage: 'retry_validation', field: 'links' });
+    }
+
+    const newAttempt = (Number(job.attempt_count) || 1) + 1;
+    const now = new Date().toISOString();
+    await executeD1(`UPDATE job_destinations SET status = 'pending', error_message = NULL, updated_at = ? WHERE job_id = ? AND status = 'failed'`, [now, id]);
+    await executeD1(`DELETE FROM job_media WHERE job_id = ?`, [id]);
+    await executeD1(`UPDATE jobs SET status = 'processing', attempt_count = ?, error_message = NULL, updated_at = ? WHERE id = ?`, [newAttempt, now, id]);
+
+    const dispatchErr = await triggerJobProcessing(id, sourceUrls);
+    if (dispatchErr) {
+      return res.status(502).json({ success: false, attempt: newAttempt, stage: 'dispatch', error: dispatchErr });
+    }
+    res.json({
+      success: true,
+      attempt: newAttempt,
+      mode: 're_dispatched_workflow',
+      message: `Attempt #${newAttempt}: Dispatched GitHub Actions media workflow (${sourceUrls.length} source link(s)).`
     });
-    res.json({ success: true, message: 'Retry initiated for failed destinations' });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }

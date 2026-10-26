@@ -13,9 +13,11 @@ import {
   Layers,
   Search,
   Activity,
-  XCircle
+  XCircle,
+  Link as LinkIcon,
+  Folder
 } from 'lucide-react';
-import { Job, JobDestination, JobMedia, JobEvent } from '../types.ts';
+import { Job, JobDestination, JobMedia, JobEvent, JobSource } from '../types.ts';
 import { api } from '../api.ts';
 
 interface HistoryTabProps {
@@ -24,19 +26,58 @@ interface HistoryTabProps {
   loading: boolean;
 }
 
+function inferSourceKind(url: string): JobSource['source_kind'] {
+  if (/\/drive\/(?:u\/\d+\/)?folders\//i.test(url)) return 'drive_folder';
+  if (/drive\.google\.com|docs\.google\.com/i.test(url)) return 'drive_file';
+  return 'direct_url';
+}
+
+function extractJobSources(job: Job, explicitSources?: JobSource[]): JobSource[] {
+  if (Array.isArray(explicitSources) && explicitSources.length > 0) {
+    return explicitSources;
+  }
+  const raw = job.sources_json || job.raw_links_json;
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((u, idx) => String(u || '').trim())
+        .filter(Boolean)
+        .map((source_url, position) => ({
+          position,
+          source_url,
+          source_kind: inferSourceKind(source_url)
+        }));
+    }
+  } catch {}
+  return [];
+}
+
 export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading }) => {
   const [filter, setFilter] = useState<string>('all');
   const [search, setSearch] = useState('');
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
-  const [jobDetails, setJobDetails] = useState<{ job: Job; media: JobMedia[]; destinations: JobDestination[]; logs: any[]; events?: JobEvent[] } | null>(null);
+  const [jobDetails, setJobDetails] = useState<{
+    job: Job;
+    sources?: JobSource[];
+    media: JobMedia[];
+    destinations: JobDestination[];
+    logs: any[];
+    events?: JobEvent[];
+  } | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [retrying, setRetrying] = useState(false);
-  const [retryMessage, setRetryMessage] = useState<string | null>(null);
+  const [retryBanner, setRetryBanner] = useState<{
+    jobId: string;
+    type: 'success' | 'error';
+    message: string;
+    runUrl?: string | null;
+  } | null>(null);
 
   const fetchJobDetails = async (id: string) => {
     setSelectedJobId(id);
     setDetailLoading(true);
-    setRetryMessage(null);
     try {
       const data = await api.getJobDetails(id);
       setJobDetails(data);
@@ -49,14 +90,25 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
 
   const handleRetryFailed = async (id: string) => {
     setRetrying(true);
-    setRetryMessage(null);
+    setRetryBanner(null);
     try {
       const res = await api.retryJob(id);
-      setRetryMessage(res.message || 'Retry initiated.');
-      await fetchJobDetails(id);
+      setRetryBanner({
+        jobId: id,
+        type: 'success',
+        message: res.message || `Attempt #${res.attempt || 2}: Retry initiated.`,
+        runUrl: res.workflow_run_url || null
+      });
+      if (selectedJobId === id) {
+        await fetchJobDetails(id);
+      }
       onRefresh();
     } catch (e: any) {
-      setRetryMessage(`Retry error: ${e.message}`);
+      setRetryBanner({
+        jobId: id,
+        type: 'error',
+        message: e.message || 'Retry failed.'
+      });
     } finally {
       setRetrying(false);
     }
@@ -70,6 +122,13 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
     }
     return true;
   });
+
+  const modalSources = jobDetails ? extractJobSources(jobDetails.job, jobDetails.sources) : [];
+  const canRetryModalJob = Boolean(
+    jobDetails &&
+    (jobDetails.job.status === 'failed' || jobDetails.job.status === 'partially_published') &&
+    jobDetails.destinations.some(d => d.status === 'failed' || d.status === 'pending')
+  );
 
   return (
     <div className="max-w-5xl mx-auto space-y-6 pb-24 md:pb-12 text-zinc-100">
@@ -90,6 +149,39 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
           <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
         </button>
       </div>
+
+      {retryBanner && !selectedJobId && (
+        <div
+          className={`p-3 rounded-xl text-xs flex items-center justify-between gap-2 ${
+            retryBanner.type === 'success'
+              ? 'bg-emerald-950/80 border border-emerald-800 text-emerald-200'
+              : 'bg-red-950/80 border border-red-800 text-red-200'
+          }`}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            {retryBanner.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
+            ) : (
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+            )}
+            <span>
+              <strong className="font-mono mr-1.5">{retryBanner.jobId}:</strong>
+              {retryBanner.message}
+            </span>
+          </div>
+          {retryBanner.runUrl && (
+            <a
+              href={retryBanner.runUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="shrink-0 px-2.5 py-1 rounded bg-emerald-900/70 hover:bg-emerald-800 text-emerald-100 font-semibold inline-flex items-center gap-1"
+            >
+              <span>Run Log</span>
+              <ExternalLink className="w-3 h-3" />
+            </a>
+          )}
+        </div>
+      )}
 
       {/* Filters & Search */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-zinc-900 border border-zinc-800 rounded-xl p-3">
@@ -135,6 +227,8 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
             const isFailed = j.status === 'failed';
             const isProcessing = j.status === 'processing' || j.status === 'publishing';
             const isCancelled = j.status === 'cancelled';
+            const cardSources = extractJobSources(j);
+            const attemptNum = Number(j.attempt_count) || 1;
 
             return (
               <div
@@ -149,6 +243,18 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
                       <span className="text-zinc-600">•</span>
                       <span className="text-[11px] text-zinc-400">
                         {new Date(j.created_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                      </span>
+                      {attemptNum > 1 && (
+                        <>
+                          <span className="text-zinc-600">•</span>
+                          <span className="text-[10px] font-semibold text-orange-300">
+                            Attempt #{attemptNum}
+                          </span>
+                        </>
+                      )}
+                      <span className="text-zinc-600">•</span>
+                      <span className="text-[10px] text-zinc-400">
+                        {cardSources.length} source{cardSources.length !== 1 ? 's' : ''}
                       </span>
                       {j.story_enabled === 1 && (
                         <span className="bg-purple-950 text-purple-300 border border-purple-800 px-1.5 py-0.2 rounded text-[9px] font-bold">
@@ -171,6 +277,18 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0 self-start">
+                    {j.workflow_run_url && !j.error_message && (
+                      <a
+                        href={j.workflow_run_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-orange-400 font-semibold text-[10px] inline-flex items-center gap-1 transition-colors"
+                      >
+                        <span>Run Log</span>
+                        <ExternalLink className="w-2.5 h-2.5" />
+                      </a>
+                    )}
                     <span
                       className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
                         isPublished
@@ -239,7 +357,14 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
           <div className="w-full max-w-2xl bg-zinc-900 border border-zinc-700 rounded-2xl p-5 text-zinc-100 max-h-[90vh] overflow-y-auto space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
               <div>
-                <span className="font-mono text-xs text-orange-400 font-bold block">{selectedJobId}</span>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-xs text-orange-400 font-bold">{selectedJobId}</span>
+                  {jobDetails && (
+                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300">
+                      Attempt #{jobDetails.job.attempt_count || 1}
+                    </span>
+                  )}
+                </div>
                 <span className="text-xs text-zinc-400">Detailed Job Lifecycle & Diagnostics</span>
               </div>
               <button
@@ -250,10 +375,33 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
               </button>
             </div>
 
-            {retryMessage && (
-              <div className="p-2.5 rounded-lg bg-zinc-800 border border-zinc-700 text-xs text-zinc-200 flex items-center gap-2">
-                <Activity className="w-3.5 h-3.5 text-orange-400" />
-                <span>{retryMessage}</span>
+            {retryBanner && retryBanner.jobId === selectedJobId && (
+              <div
+                className={`p-2.5 rounded-lg text-xs flex items-center justify-between gap-2 ${
+                  retryBanner.type === 'success'
+                    ? 'bg-emerald-950/80 border border-emerald-800 text-emerald-200'
+                    : 'bg-red-950/80 border border-red-800 text-red-200'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  {retryBanner.type === 'success' ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+                  ) : (
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0 text-red-400" />
+                  )}
+                  <span>{retryBanner.message}</span>
+                </div>
+                {retryBanner.runUrl && (
+                  <a
+                    href={retryBanner.runUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="shrink-0 px-2 py-0.5 rounded bg-emerald-900/70 hover:bg-emerald-800 text-emerald-100 font-semibold inline-flex items-center gap-1"
+                  >
+                    <span>View Run Log</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
               </div>
             )}
 
@@ -281,7 +429,9 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
                     <div className="flex items-center gap-2">
                       <Film className="w-4 h-4 text-orange-400" />
                       <div>
-                        <span className="text-[10px] uppercase font-bold text-zinc-400 block">GitHub Actions Pipeline Run</span>
+                        <span className="text-[10px] uppercase font-bold text-zinc-400 block">
+                          GitHub Actions Pipeline Run (Attempt #{jobDetails.job.attempt_count || 1})
+                        </span>
                         <span className="text-zinc-300 font-mono text-[11px]">Run #{jobDetails.job.workflow_run_id || 'active'}</span>
                       </div>
                     </div>
@@ -306,13 +456,65 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
                   )}
                 </div>
 
-                {/* Media Assets */}
+                {/* Immutable Saved Media Sources (F6.4) */}
                 <div>
                   <span className="text-[10px] uppercase font-bold text-zinc-400 block mb-2">
-                    Media Assets ({jobDetails.media.length})
+                    Saved Source Links ({modalSources.length})
+                  </span>
+                  {modalSources.length === 0 ? (
+                    <div className="p-2.5 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-300 text-[11px]">
+                      This job&apos;s original media links were not saved, so it cannot be retried. Create a new post.
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {modalSources.map((src, i) => (
+                        <div
+                          key={i}
+                          className="p-2.5 bg-zinc-950 border border-zinc-800 rounded-lg flex items-center justify-between gap-2"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            {src.source_kind === 'drive_folder' ? (
+                              <Folder className="w-4 h-4 text-amber-400 shrink-0" />
+                            ) : (
+                              <LinkIcon className="w-4 h-4 text-orange-400 shrink-0" />
+                            )}
+                            <div className="min-w-0">
+                              <span className="text-[10px] uppercase font-bold text-zinc-400 block">
+                                Source #{i + 1} • {src.source_kind.replace('_', ' ')}
+                              </span>
+                              <span className="text-[11px] text-zinc-200 truncate block font-mono">
+                                {src.source_url}
+                              </span>
+                            </div>
+                          </div>
+                          <a
+                            href={src.source_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-orange-400 hover:text-orange-300 p-1 shrink-0"
+                            title="Open Original Source Link"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Processed Release Media Assets */}
+                <div>
+                  <span className="text-[10px] uppercase font-bold text-zinc-400 block mb-2">
+                    Processed Release Assets ({jobDetails.media.length})
                   </span>
                   {jobDetails.media.length === 0 ? (
-                    <p className="text-zinc-500 text-[11px]">No media attached (Text post).</p>
+                    <p className="text-zinc-500 text-[11px]">
+                      {jobDetails.job.status === 'scheduled' || jobDetails.job.status === 'pending'
+                        ? 'Queued — saved source links will be downloaded & transcoded when due.'
+                        : jobDetails.job.status === 'processing'
+                        ? 'GitHub Actions workflow is currently downloading & transcoding media...'
+                        : 'No processed release assets currently stored (failed before upload or cleaned up after confirmed publication).'}
+                    </p>
                   ) : (
                     <div className="space-y-1.5">
                       {jobDetails.media.map((m, i) => (
@@ -329,7 +531,7 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
                             <div className="min-w-0">
                               <span className="font-semibold block truncate text-zinc-200">{m.filename || 'media'}</span>
                               <span className="text-[10px] text-zinc-500">
-                                {m.file_type} • status: {m.status} • {m.release_tag || 'direct link'}
+                                {m.file_type} • status: {m.status} • {m.release_tag || 'release asset'}
                               </span>
                             </div>
                           </div>
@@ -356,7 +558,7 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({ jobs, onRefresh, loading
                     <span className="text-[10px] uppercase font-bold text-zinc-400 block">
                       Target Destinations ({jobDetails.destinations.length})
                     </span>
-                    {jobDetails.destinations.some(d => d.status === 'failed' || d.status === 'pending') && (
+                    {canRetryModalJob && (
                       <button
                         onClick={() => handleRetryFailed(selectedJobId)}
                         disabled={retrying}

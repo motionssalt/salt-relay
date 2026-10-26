@@ -34,6 +34,15 @@ export interface JobDestination {
   last_attempt_at?: string;
 }
 
+export interface JobSource {
+  id?: string;
+  job_id?: string;
+  position: number;
+  source_url: string;
+  source_kind: 'direct_url' | 'drive_file' | 'drive_folder';
+  created_at?: string;
+}
+
 export interface JobMedia {
   id: string;
   job_id: string;
@@ -47,7 +56,10 @@ export interface JobMedia {
   height?: number;
   duration_sec?: number;
   release_tag?: string;
+  asset_id?: string;
+  asset_name?: string;
   asset_download_url?: string;
+  sha256?: string;
   status: 'pending' | 'processed' | 'failed';
   error?: string;
 }
@@ -67,17 +79,21 @@ export interface Job {
   caption: string;
   hashtags: string;
   raw_links_json: string;
+  sources_json?: string;
   publish_mode: 'now' | 'queue' | 'schedule';
   status: 'pending' | 'processing' | 'scheduled' | 'publishing' | 'published' | 'partially_published' | 'failed' | 'cancelled';
   story_enabled: number;
   scheduled_at?: string;
   published_at?: string;
   timezone: string;
+  attempt_count?: number;
+  dry_run?: number;
   error_message?: string;
   workflow_run_id?: string;
   workflow_run_url?: string;
   created_at: string;
   updated_at: string;
+  sources?: JobSource[];
   destinations?: JobDestination[];
   media?: JobMedia[];
   events?: JobEvent[];

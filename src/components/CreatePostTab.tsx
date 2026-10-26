@@ -40,7 +40,56 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
   const [scheduledAt, setScheduledAt] = useState('');
   const [selectedAccounts, setSelectedAccounts] = useState<string[]>(accounts.map(a => a.id));
   const [submitting, setSubmitting] = useState(false);
-  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string; runUrl?: string | null } | null>(null);
+
+  const validateSourceLinksClient = (rawLinks: string[]): { valid: boolean; cleanLinks: string[]; error?: string } => {
+    const cleanLinks = rawLinks.map(l => l.trim()).filter(l => l.length > 0);
+    if (cleanLinks.length === 0) {
+      return {
+        valid: false,
+        cleanLinks: [],
+        error: 'Media Sources required: Provide at least one direct image/video URL or public Google Drive file/folder link.'
+      };
+    }
+
+    for (let i = 0; i < cleanLinks.length; i++) {
+      const candidate = cleanLinks[i];
+      let parsed: URL;
+      try {
+        parsed = new URL(candidate);
+      } catch {
+        return {
+          valid: false,
+          cleanLinks,
+          error: `Media source link #${i + 1} is not a valid URL (${candidate.slice(0, 60)}).`
+        };
+      }
+
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return {
+          valid: false,
+          cleanLinks,
+          error: `Media source link #${i + 1} must start with http:// or https://.`
+        };
+      }
+
+      const host = parsed.hostname.toLowerCase();
+      if (host === 'drive.google.com' || host.endsWith('.drive.google.com') || host === 'docs.google.com') {
+        const folderMatch = parsed.pathname.match(/\/drive\/(?:u\/\d+\/)?folders\/([a-zA-Z0-9_-]{10,})/);
+        const fileMatch = parsed.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]{10,})/);
+        const queryId = parsed.searchParams.get('id');
+        if (!folderMatch && !fileMatch && !(queryId && /^[a-zA-Z0-9_-]{10,}$/.test(queryId))) {
+          return {
+            valid: false,
+            cleanLinks,
+            error: `Media source link #${i + 1} is a Google Drive URL without a valid file or folder ID.`
+          };
+        }
+      }
+    }
+
+    return { valid: true, cleanLinks };
+  };
 
   // Add/remove media link inputs
   const handleAddLink = () => setLinks([...links, '']);
@@ -55,14 +104,17 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
 
   // Inspect drive or direct links
   const handleInspectLinks = async () => {
-    const validLinks = links.filter(l => l.trim().length > 0);
-    if (validLinks.length === 0) return;
+    const check = validateSourceLinksClient(links);
+    if (!check.valid) {
+      setFeedback({ type: 'error', message: check.error || 'Enter at least one valid media link to inspect.' });
+      return;
+    }
     setInspecting(true);
     setFeedback(null);
     try {
       const allFiles: any[] = [];
-      for (const l of validLinks) {
-        const res = await api.inspectDriveOrLink(l.trim());
+      for (const l of check.cleanLinks) {
+        const res = await api.inspectDriveOrLink(l);
         if (res.files) {
           allFiles.push(...res.files);
         }
@@ -71,7 +123,7 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
       if (allFiles.length > 0) {
         setFeedback({ type: 'success', message: `Discovered and verified ${allFiles.length} media file(s).` });
       } else {
-        setFeedback({ type: 'error', message: 'No accessible files found in specified links.' });
+        setFeedback({ type: 'error', message: 'No accessible files found in specified links. Ensure Google Drive links are shared as "Anyone with the link".' });
       }
     } catch (e: any) {
       setFeedback({ type: 'error', message: `Inspection error: ${e.message}` });
@@ -95,16 +147,33 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
   // Submit job
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanLinks = links.filter(l => l.trim().length > 0);
-    if (!caption.trim() && cleanLinks.length === 0) {
-      setFeedback({ type: 'error', message: 'Please provide either a caption or at least one media link.' });
+    const linkCheck = validateSourceLinksClient(links);
+    if (!linkCheck.valid) {
+      setFeedback({ type: 'error', message: linkCheck.error || 'Please provide at least one valid media source link.' });
       return;
     }
 
     if (selectedAccounts.length === 0) {
-      setFeedback({ type: 'error', message: 'Please select at least one target account.' });
+      setFeedback({ type: 'error', message: 'Please select at least one target destination account.' });
       return;
     }
+
+    let normalizedScheduledAt: string | undefined;
+    if (publishMode === 'schedule') {
+      if (!scheduledAt || !scheduledAt.trim()) {
+        setFeedback({ type: 'error', message: 'Please choose a schedule date and time.' });
+        return;
+      }
+      const parsedDate = new Date(scheduledAt);
+      if (Number.isNaN(parsedDate.getTime())) {
+        setFeedback({ type: 'error', message: 'Invalid schedule date/time format.' });
+        return;
+      }
+      normalizedScheduledAt = parsedDate.toISOString();
+    }
+
+    const browserTimezone =
+      (typeof Intl !== 'undefined' && Intl.DateTimeFormat().resolvedOptions().timeZone) || 'Africa/Lagos';
 
     setSubmitting(true);
     setFeedback(null);
@@ -113,19 +182,25 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
       const res = await api.createJob({
         caption: caption.trim(),
         hashtags: hashtags.trim(),
-        links: cleanLinks,
+        links: linkCheck.cleanLinks,
         publish_mode: publishMode,
-        scheduled_at: publishMode === 'schedule' ? scheduledAt : undefined,
+        scheduled_at: normalizedScheduledAt,
+        timezone: browserTimezone,
         story_enabled: storyEnabled,
         selected_destinations: selectedAccounts
       });
 
       if (res.success) {
+        const dispatchedNow = res.status === 'processing' || publishMode === 'now';
+        const formattedSchedule = res.scheduled_at
+          ? new Date(res.scheduled_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+          : 'next queue slot';
         setFeedback({
           type: 'success',
-          message: publishMode === 'now'
-            ? `Job ${res.job_id} dispatched for processing & publication!`
-            : `Job ${res.job_id} scheduled for ${res.scheduled_at || 'next queue slot'}.`
+          message: dispatchedNow
+            ? `Job ${res.job_id} dispatched to GitHub Actions (${linkCheck.cleanLinks.length} media source${linkCheck.cleanLinks.length !== 1 ? 's' : ''})!`
+            : `Job ${res.job_id} scheduled for ${formattedSchedule} (${linkCheck.cleanLinks.length} media source${linkCheck.cleanLinks.length !== 1 ? 's' : ''} saved).`,
+          runUrl: res.workflow_run_url || null
         });
         setCaption('');
         setLinks(['']);
@@ -157,22 +232,35 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
 
       {feedback && (
         <div
-          className={`p-3 rounded-lg text-xs flex items-center gap-2 ${
+          className={`p-3 rounded-lg text-xs flex items-center justify-between gap-2 ${
             feedback.type === 'success'
               ? 'bg-emerald-950/80 border border-emerald-800 text-emerald-300'
               : 'bg-red-950/80 border border-red-800 text-red-300'
           }`}
         >
-          {feedback.type === 'success' ? (
-            <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
-          ) : (
-            <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+          <div className="flex items-center gap-2 min-w-0">
+            {feedback.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
+            ) : (
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+            )}
+            <span>{feedback.message}</span>
+          </div>
+          {feedback.runUrl && (
+            <a
+              href={feedback.runUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="shrink-0 px-2.5 py-1 rounded bg-emerald-900/70 hover:bg-emerald-800 text-emerald-100 font-semibold inline-flex items-center gap-1"
+            >
+              <span>View Run Log</span>
+              <ArrowRight className="w-3 h-3" />
+            </a>
           )}
-          <span>{feedback.message}</span>
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="space-y-6">
+      <form onSubmit={handleSubmit} className="space-y-6" noValidate>
         {/* Caption & Hashtags */}
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-4">
           <div>
@@ -214,7 +302,9 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <LinkIcon className="w-4 h-4 text-orange-400" />
-              <label className="text-xs font-semibold text-zinc-200">Media Sources</label>
+              <label className="text-xs font-semibold text-zinc-200">
+                Media Sources <span className="text-orange-400">*</span>
+              </label>
             </div>
             <button
               type="button"
@@ -227,14 +317,18 @@ export const CreatePostTab: React.FC<CreatePostTabProps> = ({
             </button>
           </div>
           <p className="text-[11px] text-zinc-400">
-            Paste accessible image/video links (MP4, MOV, JPG, PNG) or public Google Drive folder links.
+            Required: Paste at least one accessible image/video URL (MP4, MOV, JPG, PNG) or public Google Drive file/folder link.
           </p>
 
           <div className="space-y-2">
             {links.map((link, idx) => (
               <div key={idx} className="flex items-center gap-2">
                 <input
-                  type="url"
+                  type="text"
+                  inputMode="url"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   value={link}
                   onChange={(e) => handleUpdateLink(idx, e.target.value)}
                   placeholder="https://example.com/video.mp4 or https://drive.google.com/drive/folders/..."

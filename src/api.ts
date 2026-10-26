@@ -155,7 +155,7 @@ export const api = {
     apiFetch<{ jobs: any[] }>(`/api/jobs${status ? `?status=${status}` : ''}`),
 
   getJobDetails: (id: string) =>
-    apiFetch<{ job: any; media: any[]; destinations: any[]; logs: any[]; events?: any[] }>(`/api/jobs/${id}`),
+    apiFetch<{ job: any; sources?: any[]; media: any[]; destinations: any[]; logs: any[]; events?: any[] }>(`/api/jobs/${id}`),
 
   createJob: (payload: {
     caption: string;
@@ -163,16 +163,33 @@ export const api = {
     links: string[];
     publish_mode: 'now' | 'queue' | 'schedule';
     scheduled_at?: string;
+    timezone?: string;
     story_enabled?: boolean;
     selected_destinations?: string[];
+    dry_run?: boolean;
   }) =>
-    apiFetch<{ success: boolean; job_id: string; scheduled_at?: string }>('/api/jobs', {
+    apiFetch<{
+      success: boolean;
+      job_id: string;
+      publish_mode?: string;
+      status?: string;
+      scheduled_at?: string;
+      workflow_run_id?: string | null;
+      workflow_run_url?: string | null;
+    }>('/api/jobs', {
       method: 'POST',
       body: JSON.stringify(payload)
     }),
 
   retryJob: (id: string) =>
-    apiFetch<{ success: boolean; message: string }>(`/api/jobs/${id}/retry`, { method: 'POST' }),
+    apiFetch<{
+      success: boolean;
+      attempt?: number;
+      mode?: 'reused_verified_assets' | 're_dispatched_workflow';
+      workflow_run_id?: string | null;
+      workflow_run_url?: string | null;
+      message: string;
+    }>(`/api/jobs/${id}/retry`, { method: 'POST' }),
 
   cancelJob: (id: string) =>
     apiFetch<{ success: boolean }>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
