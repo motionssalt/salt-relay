@@ -1,14 +1,16 @@
 {
   "project": "salt-relay",
   "repo": "motionssalt/salt-relay",
-  "goal": "Fix job failure after processing (F1), accelerate FFmpeg install from 30m to <1m (F2), track real GitHub Actions run state in watchdog (F3), and handle job_878cb83e-c orphan + end-to-end dry run verification (F4)",
-  "status": "done",
-  "current_phase": "complete",
+  "goal": "Complete FIX PROMPT 2: F1-F4 (callback, fast FFmpeg, smart watchdog, dry-run) + F5 (immutable media sources, source validation, immediate/timezone-accurate dispatch) + F6 (media-aware Retry from immutable sources, verified asset reuse, legacy source backfill & UI visibility)",
+  "status": "in_progress",
+  "current_phase": "F5_immutable_sources_and_dispatch",
   "phases": [
     "F1_callback_and_upload",
     "F2_fast_ffmpeg",
     "F3_smart_watchdog",
-    "F4_cleanup_and_e2e"
+    "F4_cleanup_and_e2e",
+    "F5_immutable_sources_and_dispatch",
+    "F6_media_aware_retry"
   ],
   "queue": [
     {
@@ -34,6 +36,18 @@
       "title": "Clean up failed test job job_878cb83e-c and perform dry-run verification of complete pipeline",
       "status": "done",
       "notes": "Inspected release media-001 assets: confirmed no orphan asset was uploaded for job_878cb83e-c (left untouched in failed state for Victor to press Retry); executed end-to-end dry run (job_e2e_dryrun_success) with public video through dispatch -> run 40174497220 -> fast static FFmpeg transcode -> release upload (Asset ID 674436839) -> HMAC signed callback -> Worker publication check (no destinations published) -> verified public media proxy /api/public/media/ with 302 redirect to signed CDN URL -> cleaned up test asset and test rows; updated README with troubleshooting guide."
+    },
+    {
+      "id": "F5",
+      "title": "New posts never dispatch the workflow and fail with media files required (persist immutable sources, fix validation, timezone schedule & immediate dispatch)",
+      "status": "in_progress",
+      "notes": "Root cause proven via remote D1 (job_15f599e2-c) and worker/index.ts (commit 922b189): (1) CreatePostTab sent naive local datetime-local (2026-10-26T00:43 Africa/Lagos = 23:43Z, already due at 23:57Z) without UTC conversion, and POST /api/jobs left due scheduled jobs un-dispatched; (2) HistoryTab showed No media attached (Text post) because job_media is empty before Actions runs, and exposed Retry on scheduled jobs, which bypassed Actions and failed at Zernio with Tiktok posts require media content; (3) POST /api/jobs also allowed empty links[] when caption was present and had a broken direct-link fallback on dispatch failure."
+    },
+    {
+      "id": "F6",
+      "title": "Retry sends only caption and hashtags, never the media (rebuild Retry from stored immutable sources with verified asset reuse and UI visibility)",
+      "status": "pending",
+      "notes": "Root cause proven via remote D1 (job_878cb83e-c & job_15f599e2-c) and worker/index.ts lines 1280-1301 (commit 922b189): POST /api/jobs/:id/retry jumped directly to executePublicationStep() reading job_media (0 rows when transcode failed or had not run) instead of reading original media sources and dispatching process-media.yml, sending caption+hashtags only to Zernio."
     }
   ],
   "completed": [
@@ -51,7 +65,10 @@
     "Worker accepts valid signed late callbacks for jobs previously failed by watchdog, resetting destination failures and continuing publication, while strictly preserving operator cancellation on cancelled jobs.",
     "Left job_878cb83e-c untouched as instructed; no orphan asset existed on media-001 because GITHUB_TOKEN write failure previously aborted before upload."
   ],
-  "known_issues": [],
+  "known_issues": [
+    "F5: POST /api/jobs (commit 922b189) allows empty links when caption is non-empty, stores naive datetime-local scheduled_at without Africa/Lagos->UTC normalization, fails to dispatch due scheduled jobs immediately, and falls back to raw unexpanded URLs on GitHub dispatch failure.",
+    "F6: POST /api/jobs/:id/retry (commit 922b189) calls executePublicationStep() directly without checking/reusing release assets or re-dispatching process-media.yml from original sources, causing caption-only publishes when job_media has 0 processed rows."
+  ],
   "deployment": {
     "worker": "salt-relay-api",
     "worker_url": "https://salt-relay-api.motionssalt.workers.dev",
@@ -60,6 +77,6 @@
     "active_release": "media-001",
     "last_successful_run_id": "40174497220"
   },
-  "last_updated": "2026-10-25T07:56:00Z",
-  "last_session_note": "FIX PROMPT 2 complete. All F1-F4 tasks implemented, verified, committed, pushed to origin, and deployed to Cloudflare Worker and Pages."
+  "last_updated": "2026-10-26T00:19:46.710Z",
+  "last_session_note": "Started F5 and F6 investigation; proven root causes from remote D1 jobs job_15f599e2-c and job_878cb83e-c and git history (commit 922b189). Writing reproduction test suite next."
 }
