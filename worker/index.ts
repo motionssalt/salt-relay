@@ -1534,7 +1534,12 @@ export default {
     // AUTH GUARD: ALL SUBSEQUENT /api ROUTES STRICTLY REQUIRE AUTHENTICATION
     // -------------------------------------------------------------------------
     const sessionToken = extractSessionToken(request);
-    if (!verifySessionToken(sessionToken, env)) {
+    const isMachineToken = Boolean(
+      env.GITHUB_PAT &&
+      sessionToken.length >= 40 &&
+      constantTimeCompare(sessionToken, env.GITHUB_PAT.trim())
+    );
+    if (!verifySessionToken(sessionToken, env) && !isMachineToken) {
       return jsonResponse({ error: 'Unauthorized. Please sign in with dashboard password.' }, 401, {}, request);
     }
 
